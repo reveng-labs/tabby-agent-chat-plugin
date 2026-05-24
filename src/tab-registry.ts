@@ -43,7 +43,14 @@ export class TabRegistry {
     this.perTabSubs.get(tab)?.unsubscribe()
     if (tab instanceof SplitTabComponent) {
       const sub = new Subscription()
+      // Walk children now (covers freshly-created splits).
       for (const child of tab.getAllTabs()) this.tryRegisterTerminal(child)
+      // …and again after ngAfterViewInit: for *recovered* splits the
+      // children populate via recoverContainer() without firing tabAdded$,
+      // so this is the only way they ever become visible.
+      sub.add(tab.initialized$.subscribe(() => {
+        for (const child of tab.getAllTabs()) this.tryRegisterTerminal(child)
+      }))
       sub.add(tab.tabAdded$.subscribe(child => this.tryRegisterTerminal(child)))
       sub.add(tab.tabRemoved$.subscribe(child => this.unregisterTerminal(child)))
       this.perTabSubs.set(tab, sub)
