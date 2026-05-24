@@ -1,7 +1,7 @@
 import { Injectable } from '@angular/core'
 import { createServer, IncomingMessage, Server, ServerResponse } from 'http'
 import { randomUUID } from 'crypto'
-import { promises as fs } from 'fs'
+import { promises as fs, unlinkSync } from 'fs'
 import { homedir } from 'os'
 import * as path from 'path'
 import { LogService, Logger } from 'tabby-core'
@@ -50,17 +50,37 @@ export class McpServer {
     this.log.info(`listening on http://127.0.0.1:${this.port} (token hidden; see ${DISCOVERY_FILE})`)
 
     await this.writeDiscoveryFile()
+    this.installShutdownHooks()
+  }
+
+  private installShutdownHooks () {
+    // Renderer close / reload: initiate async stop() but don't block teardown.
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', () => { void this.stop() })
+    }
+    // Last-resort sync cleanup on hard process exit (async handlers won't run here).
+    try {
+      process.on('exit', () => {
+        try { unlinkSync(DISCOVERY_FILE) } catch { /* already gone */ }
+      })
+    } catch { /* not a Node-integrated context */ }
   }
 
   async stop () {
     if (!this.srv) return
     this.log.info('stopping http server')
-    await new Promise<void>(resolve => {
-      this.srv!.close(() => resolve())
-      // forcibly drop keep-alives so Tabby can exit promptly
-      ;(this.srv as any).closeAllConnections?.()
-    })
+    try { await fs.unlink(DISCOVERY_FILE) } catch { /* file may not exist */ }
+    const srv = this.srv
     this.srv = undefined
+    // Drop keep-alives first so close() can resolve even if a handler held a socket open.
+    try { (srv as any).closeAllConnections?.() } catch { /* nothing to do */ }
+    await new Promise<void>(resolve => {
+      let done = false
+      const finish = () => { if (!done) { done = true; resolve() } }
+      srv.close(() => finish())
+      // Hard cap: don't let a hung handler block shutdown forever.
+      setTimeout(finish, 2000).unref?.()
+    })
   }
 
   // ---------------------------------------------------------------- transport
@@ -94,7 +114,15 @@ export class McpServer {
       }
 
       const reply = await this.dispatch(msg, registry, reqId)
-      this.tryWrite(res, 200, reply)
+      if (reply === null) {
+        // JSON-RPC notification — must not produce a response body.
+        if (!res.writableEnded && !res.headersSent) {
+          res.writeHead(204)
+          res.end()
+        }
+      } else {
+        this.tryWrite(res, 200, reply)
+      }
       this.log.debug(`[#${reqId}] ${msg?.method} ${Date.now() - t0}ms`)
     } catch (e: any) {
       this.log.error(`[#${reqId}] unexpected`, e)
@@ -281,6 +309,9 @@ export class McpServer {
 
   // ---------------------------------------------------------------- utils
 
+  // NB: on timeout the underlying promise is abandoned, not cancelled — the
+  // platform getChildProcesses() implementations have no AbortSignal support.
+  // Late rejection lands on the already-settled deferred (harmless).
   private withTimeout<T> (p: Promise<T>, ms: number): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)

@@ -39,6 +39,8 @@ export class TabRegistry {
   }
 
   private walkTopLevel (tab: BaseTabComponent) {
+    // If we've already walked this tab (e.g., reparented), drop the old sub first.
+    this.perTabSubs.get(tab)?.unsubscribe()
     if (tab instanceof SplitTabComponent) {
       const sub = new Subscription()
       for (const child of tab.getAllTabs()) this.tryRegisterTerminal(child)
@@ -64,6 +66,10 @@ export class TabRegistry {
     if (!(tab as any).sessionChanged$) return
     const term = tab as BaseTerminalTabComponent<any>
 
+    // If the same pane is reparented across splits we may walk it twice;
+    // drop the previous sub before installing a new one to avoid a leak.
+    this.perTabSubs.get(term)?.unsubscribe()
+
     const sub = new Subscription()
     sub.add(term.sessionChanged$.subscribe(() => this.registerIfReady(term)))
     sub.add(term.destroyed$.subscribe(() => this.unregisterTerminal(term)))
@@ -87,7 +93,7 @@ export class TabRegistry {
     }
     this.entries.set(id, { id, tab: term })
     this.byTab.set(term, id)
-    this.log.debug(`registered tab ${id} (${term.title})`)
+    this.log.info(`registered tab ${id} (${term.title})`)
   }
 
   private unregisterTerminal (tab: BaseTabComponent) {
@@ -98,7 +104,7 @@ export class TabRegistry {
     if (id) {
       this.entries.delete(id)
       this.byTab.delete(term)
-      this.log.debug(`unregistered tab ${id}`)
+      this.log.info(`unregistered tab ${id}`)
     }
   }
 }
