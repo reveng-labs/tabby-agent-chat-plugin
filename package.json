@@ -7,8 +7,8 @@
   "license": "MIT",
   "main": "dist/index.js",
   "scripts": {
-    "build": "webpack --progress --color",
-    "watch": "webpack --progress --color --watch"
+    "build": "../tabby/node_modules/.bin/webpack --progress --color",
+    "watch": "../tabby/node_modules/.bin/webpack --progress --color --watch"
   },
   "files": ["dist"]
 }

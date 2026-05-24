@@ -1,7 +1,14 @@
 import { Injectable } from '@angular/core'
 import { Subscription } from 'rxjs'
-import { AppService, BaseTabComponent, LogService, Logger, SplitTabComponent } from 'tabby-core'
+import { AppService, BaseTabComponent, LogService, Logger } from 'tabby-core'
 import { BaseTerminalTabComponent } from 'tabby-terminal'
+
+// Duck-type a SplitTabComponent without referencing the class directly.
+// We're loaded as an external module, so `instanceof` against tabby-core's
+// class can fail when the import alias points at a fresh module instance.
+function isSplit (tab: any): boolean {
+  return tab && typeof tab.getAllTabs === 'function' && tab.tabAdded$ && tab.tabRemoved$
+}
 
 export interface TabEntry {
   id: string
@@ -18,9 +25,7 @@ export class TabRegistry {
 
   init (app: AppService, logSvc: LogService) {
     this.log = logSvc.create('input-broker:registry')
-
     for (const t of app.tabs) this.walkTopLevel(t)
-
     this.appSubs.add(app.tabOpened$.subscribe(t => this.walkTopLevel(t)))
     this.appSubs.add(app.tabClosed$.subscribe(t => this.forgetTopLevel(t)))
   }
@@ -41,18 +46,21 @@ export class TabRegistry {
   private walkTopLevel (tab: BaseTabComponent) {
     // If we've already walked this tab (e.g., reparented), drop the old sub first.
     this.perTabSubs.get(tab)?.unsubscribe()
-    if (tab instanceof SplitTabComponent) {
+    if (isSplit(tab)) {
+      const split: any = tab
       const sub = new Subscription()
       // Walk children now (covers freshly-created splits).
-      for (const child of tab.getAllTabs()) this.tryRegisterTerminal(child)
+      for (const child of split.getAllTabs()) this.tryRegisterTerminal(child)
       // …and again after ngAfterViewInit: for *recovered* splits the
       // children populate via recoverContainer() without firing tabAdded$,
       // so this is the only way they ever become visible.
-      sub.add(tab.initialized$.subscribe(() => {
-        for (const child of tab.getAllTabs()) this.tryRegisterTerminal(child)
-      }))
-      sub.add(tab.tabAdded$.subscribe(child => this.tryRegisterTerminal(child)))
-      sub.add(tab.tabRemoved$.subscribe(child => this.unregisterTerminal(child)))
+      if (split.initialized$) {
+        sub.add(split.initialized$.subscribe(() => {
+          for (const child of split.getAllTabs()) this.tryRegisterTerminal(child)
+        }))
+      }
+      sub.add(split.tabAdded$.subscribe((child: BaseTabComponent) => this.tryRegisterTerminal(child)))
+      sub.add(split.tabRemoved$.subscribe((child: BaseTabComponent) => this.unregisterTerminal(child)))
       this.perTabSubs.set(tab, sub)
     } else {
       this.tryRegisterTerminal(tab)
@@ -62,8 +70,8 @@ export class TabRegistry {
   private forgetTopLevel (tab: BaseTabComponent) {
     this.perTabSubs.get(tab)?.unsubscribe()
     this.perTabSubs.delete(tab)
-    if (tab instanceof SplitTabComponent) {
-      for (const child of tab.getAllTabs()) this.unregisterTerminal(child)
+    if (isSplit(tab)) {
+      for (const child of (tab as any).getAllTabs()) this.unregisterTerminal(child)
     } else {
       this.unregisterTerminal(tab)
     }
@@ -73,8 +81,6 @@ export class TabRegistry {
     if (!(tab as any).sessionChanged$) return
     const term = tab as BaseTerminalTabComponent<any>
 
-    // If the same pane is reparented across splits we may walk it twice;
-    // drop the previous sub before installing a new one to avoid a leak.
     this.perTabSubs.get(term)?.unsubscribe()
 
     const sub = new Subscription()
@@ -89,7 +95,18 @@ export class TabRegistry {
     const session: any = term.session
     if (!session || typeof session.getID !== 'function') return
     const id = session.getID()
-    if (!id) return
+    if (!id) {
+      // PTY hasn't started yet — getID() becomes valid once PTYProxy is set
+      // during session.start(). First output byte = "session is alive" signal.
+      if (session.binaryOutput$ && !this.byTab.get(term)) {
+        const onceSub = session.binaryOutput$.subscribe(() => {
+          onceSub.unsubscribe()
+          this.registerIfReady(term)
+        })
+        this.perTabSubs.get(term)?.add(onceSub)
+      }
+      return
+    }
 
     const prev = this.byTab.get(term)
     if (prev === id) return
