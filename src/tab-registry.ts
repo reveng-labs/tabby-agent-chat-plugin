@@ -1,5 +1,6 @@
 import { Injectable } from '@angular/core'
-import { AppService, BaseTabComponent } from 'tabby-core'
+import { Subscription } from 'rxjs'
+import { AppService, BaseTabComponent, LogService, Logger, SplitTabComponent } from 'tabby-core'
 import { BaseTerminalTabComponent } from 'tabby-terminal'
 
 export interface TabEntry {
@@ -10,11 +11,23 @@ export interface TabEntry {
 @Injectable({ providedIn: 'root' })
 export class TabRegistry {
   private entries = new Map<string, TabEntry>()
+  private byTab = new WeakMap<BaseTerminalTabComponent<any>, string>()
+  private perTabSubs = new WeakMap<BaseTabComponent, Subscription>()
+  private appSubs = new Subscription()
+  private log!: Logger
 
-  attach (app: AppService) {
-    for (const t of app.tabs) this.tryRegister(t)
-    app.tabOpened$.subscribe(t => this.tryRegister(t))
-    app.tabClosed$.subscribe(t => this.unregister(t))
+  init (app: AppService, logSvc: LogService) {
+    this.log = logSvc.create('input-broker:registry')
+
+    for (const t of app.tabs) this.walkTopLevel(t)
+
+    this.appSubs.add(app.tabOpened$.subscribe(t => this.walkTopLevel(t)))
+    this.appSubs.add(app.tabClosed$.subscribe(t => this.forgetTopLevel(t)))
+  }
+
+  destroy () {
+    this.appSubs.unsubscribe()
+    this.entries.clear()
   }
 
   list (): TabEntry[] {
@@ -25,19 +38,67 @@ export class TabRegistry {
     return this.entries.get(id)
   }
 
-  private tryRegister (tab: BaseTabComponent) {
-    const term = tab as BaseTerminalTabComponent<any>
-    const session = term.session
-    if (!session || typeof (session as any).getID !== 'function') return
-    const id = (session as any).getID()
-    if (!id) return
-    this.entries.set(id, { id, tab: term })
-    tab.destroyed$.subscribe(() => this.entries.delete(id))
+  private walkTopLevel (tab: BaseTabComponent) {
+    if (tab instanceof SplitTabComponent) {
+      const sub = new Subscription()
+      for (const child of tab.getAllTabs()) this.tryRegisterTerminal(child)
+      sub.add(tab.tabAdded$.subscribe(child => this.tryRegisterTerminal(child)))
+      sub.add(tab.tabRemoved$.subscribe(child => this.unregisterTerminal(child)))
+      this.perTabSubs.set(tab, sub)
+    } else {
+      this.tryRegisterTerminal(tab)
+    }
   }
 
-  private unregister (tab: BaseTabComponent) {
-    for (const [id, e] of this.entries) {
-      if (e.tab === tab) this.entries.delete(id)
+  private forgetTopLevel (tab: BaseTabComponent) {
+    this.perTabSubs.get(tab)?.unsubscribe()
+    this.perTabSubs.delete(tab)
+    if (tab instanceof SplitTabComponent) {
+      for (const child of tab.getAllTabs()) this.unregisterTerminal(child)
+    } else {
+      this.unregisterTerminal(tab)
+    }
+  }
+
+  private tryRegisterTerminal (tab: BaseTabComponent) {
+    if (!(tab as any).sessionChanged$) return
+    const term = tab as BaseTerminalTabComponent<any>
+
+    const sub = new Subscription()
+    sub.add(term.sessionChanged$.subscribe(() => this.registerIfReady(term)))
+    sub.add(term.destroyed$.subscribe(() => this.unregisterTerminal(term)))
+    this.perTabSubs.set(term, sub)
+
+    this.registerIfReady(term)
+  }
+
+  private registerIfReady (term: BaseTerminalTabComponent<any>) {
+    const session: any = term.session
+    if (!session || typeof session.getID !== 'function') return
+    const id = session.getID()
+    if (!id) return
+
+    const prev = this.byTab.get(term)
+    if (prev === id) return
+    if (prev) this.entries.delete(prev)
+
+    if (this.entries.has(id)) {
+      this.log.warn(`duplicate session id ${id}; overwriting`)
+    }
+    this.entries.set(id, { id, tab: term })
+    this.byTab.set(term, id)
+    this.log.debug(`registered tab ${id} (${term.title})`)
+  }
+
+  private unregisterTerminal (tab: BaseTabComponent) {
+    this.perTabSubs.get(tab)?.unsubscribe()
+    this.perTabSubs.delete(tab)
+    const term = tab as BaseTerminalTabComponent<any>
+    const id = this.byTab.get(term)
+    if (id) {
+      this.entries.delete(id)
+      this.byTab.delete(term)
+      this.log.debug(`unregistered tab ${id}`)
     }
   }
 }

@@ -3,15 +3,12 @@
   "version": "0.1.0",
   "description": "Exposes Tabby tabs over MCP so an AI agent in one tab can send input to another",
   "keywords": ["tabby-plugin"],
+  "author": "tabby-input-broker contributors",
+  "license": "MIT",
   "main": "dist/index.js",
   "scripts": {
     "build": "webpack --progress --color",
     "watch": "webpack --progress --color --watch"
   },
-  "files": ["dist"],
-  "license": "MIT",
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
-    "zod": "^3.23.0"
-  }
+  "files": ["dist"]
 }
