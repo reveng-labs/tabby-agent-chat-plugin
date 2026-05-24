@@ -1,0 +1,7 @@
+{
+  "extends": "../tabby/tsconfig.json",
+  "exclude": ["node_modules", "dist"],
+  "compilerOptions": {
+    "baseUrl": "src"
+  }
+}
