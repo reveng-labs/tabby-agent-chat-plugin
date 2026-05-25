@@ -140,6 +140,7 @@ export class TabRegistry {
     this.perTabSubs.get(tab)?.unsubscribe()
     this.perTabSubs.delete(tab)
     const term = tab as BaseTerminalTabComponent<any>
+    this.pendingFirstOutput.delete(term)
     const id = this.byTab.get(term)
     if (id) {
       this.entries.delete(id)

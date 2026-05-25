@@ -1,4 +1,5 @@
 import { Injectable } from '@angular/core'
+import { AddressInfo } from 'net'
 import { createServer, IncomingMessage, Server, ServerResponse } from 'http'
 import { randomUUID } from 'crypto'
 import { promises as fs, unlinkSync } from 'fs'
@@ -49,12 +50,19 @@ export class McpServer {
   private token = randomUUID()
   private log!: Logger
   private reqSeq = 0
+  private starting?: Promise<void>
+  private exitHandler?: () => void
 
-  async start (registry: TabRegistry, logSvc: LogService) {
-    if (this.srv) {
-      // Already started — protect against double-init on HMR / re-construction.
-      return
-    }
+  async start (registry: TabRegistry, logSvc: LogService): Promise<void> {
+    // Protect against concurrent or repeated calls: both same-tick callers
+    // share the same in-flight promise; later callers see this.srv already set.
+    if (this.srv) return
+    if (this.starting) return this.starting
+    this.starting = this._start(registry, logSvc)
+    try { await this.starting } finally { this.starting = undefined }
+  }
+
+  private async _start (registry: TabRegistry, logSvc: LogService) {
     this.log = logSvc.create('input-broker')
 
     const srv = createServer((req, res) => {
@@ -77,8 +85,14 @@ export class McpServer {
       srv.listen(0, '127.0.0.1')
     })
 
+    const addr = srv.address()
+    if (!addr || typeof addr === 'string') {
+      this.log.error(`listen returned unexpected address: ${JSON.stringify(addr)}`)
+      try { srv.close() } catch { /* nothing to do */ }
+      throw new Error('listen returned non-AddressInfo')
+    }
     this.srv = srv
-    this.port = (srv.address() as any).port
+    this.port = (addr as AddressInfo).port
     this.log.info(`listening on http://127.0.0.1:${this.port} (token hidden; see ${DISCOVERY_FILE})`)
 
     // Inject discovery vars into the renderer's env so every shell Tabby
@@ -96,15 +110,21 @@ export class McpServer {
     if (typeof window !== 'undefined') {
       window.addEventListener('beforeunload', () => {
         // Sync cleanup first — async stop() may not finish before renderer exits.
-        try { unlinkSync(DISCOVERY_FILE) } catch { /* may not exist */ }
+        this.unlinkDiscoverySync()
         void this.stop()
       })
     }
     try {
-      process.on('exit', () => {
-        try { unlinkSync(DISCOVERY_FILE) } catch { /* already gone */ }
-      })
+      this.exitHandler = () => this.unlinkDiscoverySync()
+      process.once('exit', this.exitHandler)
     } catch { /* not a Node-integrated context */ }
+  }
+
+  private unlinkDiscoverySync () {
+    try { unlinkSync(DISCOVERY_FILE) }
+    catch (e: any) {
+      if (e?.code !== 'ENOENT') this.log?.warn?.(`unlinkSync(discovery): ${e?.message}`)
+    }
   }
 
   async stop () {
@@ -112,17 +132,29 @@ export class McpServer {
     this.log.info('stopping http server')
     delete process.env.TABBY_BRIDGE_URL
     delete process.env.TABBY_BRIDGE_TOKEN
-    try { await fs.unlink(DISCOVERY_FILE) } catch { /* file may not exist */ }
+    try { await fs.unlink(DISCOVERY_FILE) }
+    catch (e: any) { if (e?.code !== 'ENOENT') this.log.warn(`unlink(discovery): ${e?.message}`) }
+    if (this.exitHandler) {
+      try { process.removeListener('exit', this.exitHandler) } catch { /* not a Node context */ }
+      this.exitHandler = undefined
+    }
     const srv = this.srv
     this.srv = undefined
     // Drop keep-alives first so close() can resolve even if a handler held a socket open.
-    try { (srv as any).closeAllConnections?.() } catch { /* nothing to do */ }
+    try { srv.closeAllConnections?.() } catch { /* nothing to do */ }
     await new Promise<void>(resolve => {
       let done = false
-      const finish = () => { if (!done) { done = true; resolve() } }
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const finish = () => {
+        if (done) return
+        done = true
+        if (timer) clearTimeout(timer)
+        resolve()
+      }
       srv.close(() => finish())
       // Hard cap: don't let a hung handler block shutdown forever.
-      setTimeout(finish, 2000).unref?.()
+      timer = setTimeout(finish, 2000)
+      timer.unref?.()
     })
   }
 
@@ -200,9 +232,9 @@ export class McpServer {
         resolve(Buffer.concat(chunks).toString('utf8'))
       })
       req.on('error', fail)
-      req.on('aborted', () => fail(new Error('aborted')))
-      // Node 17+ deprecated 'aborted' in favor of socket 'close' fired when
-      // the connection drops before req emits 'end'.
+      // 'close' fires on disconnect; we treat it as failure only if the body
+      // didn't complete cleanly. ('aborted' is deprecated in Node 17+ and is
+      // a subset of 'close' for our purposes.)
       req.on('close', () => {
         if (!settled && !req.complete) fail(new Error('connection closed before body complete'))
       })
@@ -248,7 +280,9 @@ export class McpServer {
         capabilities: { tools: {} },
       })
     }
-    if (msg.method === 'notifications/initialized') return null
+    // Any JSON-RPC notification (no `id`) — or anything in the notifications/*
+    // namespace — must NOT produce a response per JSON-RPC 2.0 and MCP spec.
+    if (msg.id === undefined || msg.method.startsWith('notifications/')) return null
 
     if (msg.method === 'tools/list') {
       return reply({ tools: this.toolList() })
@@ -403,6 +437,13 @@ export class McpServer {
   private async writeDiscoveryFile () {
     try {
       await fs.mkdir(path.dirname(DISCOVERY_FILE), { recursive: true })
+      // unlink first: fs.writeFile honours `mode` only on file creation,
+      // so a pre-existing 0644 (e.g., from a foreign-uid prior run) would
+      // not be tightened. Removing-then-writing guarantees 0600.
+      try { await fs.unlink(DISCOVERY_FILE) }
+      catch (e: any) {
+        if (e?.code !== 'ENOENT') this.log.warn(`pre-write unlink: ${e?.message}`)
+      }
       const payload = JSON.stringify({
         pid: process.pid,
         port: this.port,
