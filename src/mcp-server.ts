@@ -3,6 +3,7 @@ import { AddressInfo } from 'net'
 import { createServer, IncomingMessage, Server, ServerResponse } from 'http'
 import { randomUUID } from 'crypto'
 import { promises as fs } from 'fs'
+import { spawn } from 'child_process'
 import * as path from 'path'
 import { AppService, LogService, Logger, ProfilesService } from 'tabby-core'
 import { TabRegistry } from './tab-registry'
@@ -14,6 +15,69 @@ const CHILD_PROC_TIMEOUT_MS = 1000              // bound list_tabs latency
 const MAX_TAB_NAME_LEN = 64                     // tab name length cap
 const MAX_TABS = 64                             // fork-bomb cap for new_tab
 const NEW_TAB_WAIT_MS = 15000                   // wait for new tab to register (high under load)
+const WSL_QUERY_TIMEOUT_MS = 2000               // per-tab WSL /proc query timeout
+
+// Run inside WSL via `wsl.exe -- sh -c <SCRIPT> _ <TAB_ID>`. Locates the bash
+// whose /proc/<pid>/environ contains the marker, walks its descendants, emits
+// "pid<TAB>ppid<TAB>cmdline" lines for each.
+const WSL_QUERY_SCRIPT = `T="$1"
+root=$(grep -al "TABBY_AGENT_CHAT_TAB_ID=$T" /proc/*/environ 2>/dev/null | head -1 | cut -d/ -f3)
+[ -z "$root" ] && exit 0
+front="$root"; all="$root"
+while [ -n "$front" ]; do
+  nxt=""
+  for p in $front; do
+    for c in $(pgrep -P "$p" 2>/dev/null); do all="$all $c"; nxt="$nxt $c"; done
+  done
+  front="$nxt"
+done
+for pid in $all; do
+  if [ -e /proc/$pid/cmdline ]; then
+    cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
+    ppid=$(awk '/^PPid:/ {print $2}' /proc/$pid/status 2>/dev/null)
+    printf '%s\\t%s\\t%s\\n' "$pid" "$ppid" "$cmd"
+  fi
+done`
+
+function queryWslProcessesByTabId (tabId: string, timeoutMs: number): Promise<RawProc[]> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('wsl.exe', ['--', 'sh', '-c', WSL_QUERY_SCRIPT, '_', tabId], { windowsHide: true })
+    let stdout = ''
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      try { child.kill() } catch { /* already gone */ }
+      reject(new Error(`wsl.exe query timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+    timer.unref?.()
+    child.stdout?.on('data', d => { stdout += d.toString() })
+    child.on('error', err => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(err)
+    })
+    child.on('close', () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      const procs: RawProc[] = []
+      for (const line of stdout.split('\n')) {
+        if (!line.trim()) continue
+        const parts = line.split('\t')
+        if (parts.length < 3) continue
+        const pid = parseInt(parts[0], 10)
+        const ppid = parseInt(parts[1], 10)
+        const cmdline = parts[2].trim()
+        if (!Number.isFinite(pid)) continue
+        const argv0 = (cmdline.split(' ')[0] || '').split('/').pop() || ''
+        procs.push({ pid, ppid, command: argv0, cmdline })
+      }
+      resolve(procs)
+    })
+  })
+}
 
 function validateTabName (name: unknown): { ok: true, name: string } | { ok: false, code: string, error: string } {
   if (typeof name !== 'string') return { ok: false, code: 'invalid_args', error: 'name must be a string' }
@@ -437,6 +501,26 @@ export class McpServer {
           this.log.warn(`[#${reqId}] getChildProcesses(${e.id}) failed: ${processes_error}`)
         }
       }
+
+      // On Windows, the Windows-side process tree dead-ends at wsl.exe for
+      // WSL tabs. Cross the boundary by querying /proc inside WSL and
+      // matching back to this tab via the injected TABBY_AGENT_CHAT_TAB_ID.
+      // If the marker isn't found (non-WSL tab, or tab spawned before our
+      // injector ran), the query returns empty and we keep the Windows-side
+      // results.
+      if (process.platform === 'win32') {
+        try {
+          const wslProcs = await queryWslProcessesByTabId(e.id, WSL_QUERY_TIMEOUT_MS)
+          if (wslProcs.length > 0) {
+            processes = wslProcs   // replace useless Windows-side helpers with the real WSL tree
+          }
+        } catch (err: any) {
+          // Common: no WSL installed, or wsl.exe not on PATH — leave a soft
+          // warning, don't fail the whole list_tabs call.
+          this.log.warn(`[#${reqId}] wsl query for tab ${e.id} failed: ${err?.message}`)
+        }
+      }
+
       const customTitle = ((e.tab as any).customTitle as string | undefined) ?? ''
       const title = customTitle || (e.tab.title ?? '')
       return {
