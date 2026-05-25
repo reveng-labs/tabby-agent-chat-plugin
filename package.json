@@ -1,8 +1,10 @@
 {
   "name": "tabby-agent-chat",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Agent Chat for Tabby — exposes terminal tabs over MCP so an AI agent in one tab can send input to another",
-  "keywords": ["tabby-plugin"],
+  "keywords": [
+    "tabby-plugin"
+  ],
   "author": "tabby-agent-chat contributors",
   "license": "MIT",
   "main": "dist/index.js",
@@ -12,7 +14,10 @@
     "watch": "webpack --progress --color --watch",
     "prepublishOnly": "npm run build"
   },
-  "files": ["dist", "INSTALL.md"],
+  "files": [
+    "dist",
+    "INSTALL.md"
+  ],
   "devDependencies": {
     "@angular/core": "^15.2.6",
     "@types/node": "^18.0.0",
