@@ -52,11 +52,14 @@ at runtime.
 
 * `list_tabs` — returns every terminal tab in the current Tabby window.
   Each entry has:
-    - `id`        stable string id for the tab (use with `send_to_tab`)
-    - `title`     human-readable tab title
-    - `processes` `[{pid, ppid, command, cmdline?}]` — the process tree
-                  running in the tab. `cmdline` reveals which agent is
-                  running (e.g. `node …/codex`, `claude`)
+    - `id`        stable string id for the tab (use with `send_to_tab`
+                  and `rename_tab`)
+    - `name`      what the user sees on the tab header: the custom name
+                  if one was set (via Tabby's Rename or `rename_tab`),
+                  otherwise the auto-title derived from the shell
+    - `processes` `[{pid, ppid, command, cmdline?}]` — the full process
+                  tree running in the tab. `cmdline` reveals which
+                  agent is running (e.g. `node …/codex`, `claude`)
 
 * `send_to_tab(tab_id, text, [submit=true], [mode="auto"])` — inject text
   into the target tab's stdin. The receiving program cannot distinguish

@@ -96,7 +96,7 @@ const SERVER_INSTRUCTIONS = `This server exposes terminal tabs in the current Ta
 agent-to-agent messaging.
 
 WORKFLOW:
-1. Call list_tabs → each tab has id, title, and processes (with cmdline).
+1. Call list_tabs → each tab has id, name, and processes (with cmdline).
 2. Identify the target agent by inspecting cmdline of the processes in
    each tab. Examples: "node …/codex" = Codex; "claude" = Claude Code;
    "node …/aider" = Aider.
@@ -425,7 +425,7 @@ export class McpServer {
     return [
       {
         name: 'list_tabs',
-        description: 'List Tabby tabs in this window with running processes. Returns each tab\'s session id, title and process list.',
+        description: 'List Tabby tabs in this window with running processes. Returns each tab\'s id (use with send_to_tab/rename_tab), name (what the user sees on the tab header — custom name if set, otherwise auto-title), and process list.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       },
       {
@@ -510,17 +510,16 @@ export class McpServer {
         }
       }
 
-      // Read displayed title from the top-level tab (where the UI's Rename
+      // Read displayed name from the top-level tab (where the UI's Rename
       // sets customTitle). The inner terminal's customTitle/title only show
       // the bash OSC title like "user@host: ~", which doesn't match what the
-      // user sees.
+      // user sees in the tab header.
       const top = topLevelTab(e.tab)
       const customTitle = ((top as any).customTitle as string | undefined) ?? ''
-      const title = customTitle || (top.title ?? e.tab.title ?? '')
+      const name = customTitle || (top.title ?? e.tab.title ?? '')
       return {
         id: e.id,
-        title,                                                  // what the user sees in the tab header
-        name: customTitle || undefined,                          // present only if a custom name was set
+        name,                                                   // what the user sees on the tab header
         processes,
         ...(processes_error ? { processes_error } : {}),
       }
