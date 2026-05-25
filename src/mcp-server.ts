@@ -24,15 +24,14 @@ WORKFLOW:
 3. Call send_to_tab(tab_id, text) → injects text into the target's
    stdin as if typed.
 
-NOTES:
-- Default mode auto-detects bracketed-paste support. Pass
-  mode: "keystrokes" for raw control bytes (Ctrl-C = \\x03).
-- Tab ids are stable for the session's lifetime; reuse across calls.
-- Only local terminal tabs are addressable. SSH, serial, and telnet
-  sessions are not visible.
-- Each Tabby window runs its own server; tabs in other windows are
-  unreachable.
-- Do not send to your own tab — you would echo yourself.`
+EXAMPLE USE CASE — when the user asks "send X to the agent doing Y":
+1. list_tabs to learn which agent runs in each tab (from cmdline).
+2. Read each agent's transcript from its own on-disk store to find
+   which one is working on Y:
+     Claude Code: ~/.claude/projects/<slug>/...
+     Codex:       ~/.codex/sessions/<id>/...
+     Other tools: consult their respective docs.
+3. send_to_tab(tab_id, "X") to that tab.`
 
 interface RawProc { pid: number; ppid: number; command: string; cmdline?: string }
 
