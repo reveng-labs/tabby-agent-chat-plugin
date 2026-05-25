@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write   # for creating the GitHub Release
-      id-token: write   # for npm OIDC Trusted Publishing
+      id-token: write   # for npm OIDC Trusted Publishing (used once TP is configured)
 
     steps:
       - uses: actions/checkout@v4
@@ -35,17 +35,18 @@ jobs:
             exit 1
           fi
 
-      # Trusted Publishing requires npm CLI >= 11.5.1 — the Node 20 default is 10.x.
-      - run: npm install -g npm@latest
-
       - run: npm ci
       - run: npm run build
 
-      # No NODE_AUTH_TOKEN — npm CLI does an OIDC exchange with the
-      # registry, which validates this workflow against the Trusted
-      # Publisher configured on npmjs.com for `tabby-agent-chat`.
+      # First publish uses NPM_TOKEN because npm requires a package to
+      # exist before Trusted Publishing can be configured for it. After
+      # the first publish, configure TP on npmjs.com/package/<name>/access
+      # and switch this step to `npm publish --access public --provenance`
+      # (drop NODE_AUTH_TOKEN); the OIDC handshake will use id-token.
       - name: Publish to npm
-        run: npm publish --access public --provenance
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
