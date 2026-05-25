@@ -68,6 +68,18 @@ at runtime.
                           (e.g. `text="\x03"` for Ctrl-C)
     - `submit=true` (default) appends `\r` so the line is "entered"
 
+* `rename_tab(tab_id, name)` — set a tab's custom name. Names must be
+  unique among addressable tabs, 1–64 chars, no control characters.
+  Returns `{ok, tab_id, name}` or one of the error codes:
+  `invalid_args`, `unknown_tab`, `name_in_use`, `internal`.
+
+* `new_tab([name])` — open a new local terminal tab in this window.
+  Refuses to create more than 64 addressable tabs (fork-bomb guard).
+  Optionally sets a custom name in the same call. Returns
+  `{ok, tab_id, name?}` once the new tab has a stable id, or one of:
+  `too_many_tabs`, `name_in_use`, `no_local_profile`, `open_failed`,
+  `register_timeout`, `internal`.
+
 ## Typical use case
 
 User asks one agent: "send X to the agent doing Y".

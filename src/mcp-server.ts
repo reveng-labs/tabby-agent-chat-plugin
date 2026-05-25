@@ -4,13 +4,26 @@ import { createServer, IncomingMessage, Server, ServerResponse } from 'http'
 import { randomUUID } from 'crypto'
 import { promises as fs } from 'fs'
 import * as path from 'path'
-import { LogService, Logger } from 'tabby-core'
+import { AppService, LogService, Logger, ProfilesService } from 'tabby-core'
 import { TabRegistry } from './tab-registry'
 import pkg from '../package.json'
 
 const MAX_BODY_BYTES = 1024 * 1024              // 1 MB hard cap
 const MAX_TEXT_BYTES = 64 * 1024                // per send_to_tab payload
 const CHILD_PROC_TIMEOUT_MS = 1000              // bound list_tabs latency
+const MAX_TAB_NAME_LEN = 64                     // tab name length cap
+const MAX_TABS = 64                             // fork-bomb cap for new_tab
+const NEW_TAB_WAIT_MS = 15000                   // wait for new tab to register (high under load)
+
+function validateTabName (name: unknown): { ok: true, name: string } | { ok: false, code: string, error: string } {
+  if (typeof name !== 'string') return { ok: false, code: 'invalid_args', error: 'name must be a string' }
+  if (name.length === 0) return { ok: false, code: 'invalid_args', error: 'name must not be empty' }
+  if (name.length > MAX_TAB_NAME_LEN) return { ok: false, code: 'invalid_args', error: `name exceeds ${MAX_TAB_NAME_LEN} chars` }
+  // Reject C0/C1 control chars (newline, tab, BEL, etc.) — they corrupt the tab header.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f-\x9f]/.test(name)) return { ok: false, code: 'invalid_args', error: 'name contains control characters' }
+  return { ok: true, name }
+}
 // INSTALL.md ships with the plugin. dist/index.js sits at
 // <install>/dist/index.js, so the markdown is one dir up.
 const INSTALL_FILE = path.resolve(__dirname, '..', 'INSTALL.md')
@@ -65,6 +78,13 @@ async function readCmdlinesBounded (pids: number[]): Promise<Map<number, string 
   return out
 }
 
+export interface StartOptions {
+  registry: TabRegistry
+  logSvc: LogService
+  app: AppService
+  profiles: ProfilesService
+}
+
 @Injectable({ providedIn: 'root' })
 export class McpServer {
   private srv?: Server
@@ -73,21 +93,23 @@ export class McpServer {
   private log!: Logger
   private reqSeq = 0
   private starting?: Promise<void>
+  private opts!: StartOptions
 
-  async start (registry: TabRegistry, logSvc: LogService): Promise<void> {
+  async start (opts: StartOptions): Promise<void> {
     // Protect against concurrent or repeated calls: both same-tick callers
     // share the same in-flight promise; later callers see this.srv already set.
     if (this.srv) return
     if (this.starting) return this.starting
-    this.starting = this._start(registry, logSvc)
+    this.starting = this._start(opts)
     try { await this.starting } finally { this.starting = undefined }
   }
 
-  private async _start (registry: TabRegistry, logSvc: LogService) {
-    this.log = logSvc.create('agent-chat')
+  private async _start (opts: StartOptions) {
+    this.opts = opts
+    this.log = opts.logSvc.create('agent-chat')
 
     const srv = createServer((req, res) => {
-      this.safeHandle(req, res, registry).catch(err => {
+      this.safeHandle(req, res, opts.registry).catch(err => {
         this.log.error('handler crashed (suppressed)', err)
         this.tryWrite(res, 500, { ok: false, code: 'internal', error: 'handler crashed' })
       })
@@ -296,6 +318,8 @@ export class McpServer {
       try {
         if (name === 'list_tabs') return reply(await this.toolListTabs(registry, reqId))
         if (name === 'send_to_tab') return reply(await this.toolSend(registry, args, reqId))
+        if (name === 'rename_tab') return reply(await this.toolRename(args, reqId))
+        if (name === 'new_tab')    return reply(await this.toolNew(args, reqId))
         return err(-32601, `unknown tool: ${name}`)
       } catch (e: any) {
         this.log.error(`[#${reqId}] tool ${name} threw`, e)
@@ -332,6 +356,31 @@ export class McpServer {
           },
         },
       },
+      {
+        name: 'rename_tab',
+        description: 'Set a custom name on the target tab. The name appears in list_tabs and in Tabby\'s tab header. Names must be unique across registered tabs (no two tabs can share the same custom name).',
+        inputSchema: {
+          type: 'object',
+          required: ['tab_id', 'name'],
+          additionalProperties: false,
+          properties: {
+            tab_id: { type: 'string', minLength: 1, maxLength: 128 },
+            name:   { type: 'string', minLength: 1, maxLength: MAX_TAB_NAME_LEN },
+          },
+        },
+      },
+      {
+        name: 'new_tab',
+        description: `Open a new terminal tab in the current Tabby window. Optionally set its custom name in the same call. Refuses to create more than ${MAX_TABS} addressable tabs to prevent runaway creation. Returns once the new tab has a stable id.`,
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            name: { type: 'string', minLength: 1, maxLength: MAX_TAB_NAME_LEN,
+                    description: 'Optional custom name to set on the new tab (subject to the same uniqueness rule as rename_tab).' },
+          },
+        },
+      },
     ]
   }
 
@@ -358,7 +407,15 @@ export class McpServer {
           this.log.warn(`[#${reqId}] getChildProcesses(${e.id}) failed: ${processes_error}`)
         }
       }
-      return { id: e.id, title: e.tab.title, processes, ...(processes_error ? { processes_error } : {}) }
+      const customTitle = ((e.tab as any).customTitle as string | undefined) ?? ''
+      const title = customTitle || (e.tab.title ?? '')
+      return {
+        id: e.id,
+        title,                                                  // what the user sees in the tab header
+        name: customTitle || undefined,                          // present only if a custom name was set
+        processes,
+        ...(processes_error ? { processes_error } : {}),
+      }
     }))
 
     this.log.debug(`[#${reqId}] list_tabs returned ${tabs.length} tab(s)`)
@@ -417,6 +474,132 @@ export class McpServer {
     this.log.info(`[#${reqId}] sent tab=${entry.id} mode=${reqMode}→${effectiveMode} (bp=${supportsBP}) submit=${submit} bytes=${buf.length}`)
     const result = { ok: true, tab_id: entry.id, bytes_sent: buf.length }
     return { structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }] }
+  }
+
+  private async toolRename (args: any, reqId: number) {
+    if (typeof args?.tab_id !== 'string' || !args.tab_id) {
+      return this.toolErr('invalid_args', 'tab_id (string) is required')
+    }
+    const v = validateTabName(args?.name)
+    if (!v.ok) return this.toolErr(v.code, v.error)
+
+    const registry = this.opts.registry
+    const entry = registry.get(args.tab_id)
+    if (!entry) {
+      return this.toolErr('unknown_tab', `no tab with id ${args.tab_id}`, { available_ids: registry.list().map(e => e.id) })
+    }
+
+    // Uniqueness: another tab must not already have this customTitle.
+    const dupe = registry.list().find(e => e.id !== entry.id && (e.tab as any).customTitle === v.name)
+    if (dupe) {
+      return this.toolErr('name_in_use', `name "${v.name}" already used by tab ${dupe.id}`, { conflicting_tab_id: dupe.id })
+    }
+
+    try {
+      (entry.tab as any).setTitle?.(v.name)
+      ;(entry.tab as any).customTitle = v.name
+      this.opts.app.emitTabsChanged()
+    } catch (e: any) {
+      this.log.error(`[#${reqId}] rename failed`, e)
+      return this.toolErr('internal', e?.message ?? String(e))
+    }
+
+    this.log.info(`[#${reqId}] renamed tab=${entry.id} name="${v.name}"`)
+    const result = { ok: true, tab_id: entry.id, name: v.name }
+    return { structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }] }
+  }
+
+  private async toolNew (args: any, reqId: number) {
+    const registry = this.opts.registry
+    const current = registry.list().length
+    if (current >= MAX_TABS) {
+      return this.toolErr('too_many_tabs', `tab cap reached (${current}/${MAX_TABS}); refusing to open new tab`)
+    }
+
+    // Validate the name shape (uniqueness is re-checked AFTER the tab is
+    // registered to close the race window between concurrent new_tab calls).
+    let validatedName: string | undefined
+    if (args?.name !== undefined) {
+      const v = validateTabName(args.name)
+      if (!v.ok) return this.toolErr(v.code, v.error)
+      validatedName = v.name
+    }
+
+    // Pick a local profile (SSH/serial/telnet aren't addressable by this plugin).
+    let profile: any
+    try {
+      const all = await this.opts.profiles.getProfiles()
+      profile = all.find((p: any) => p.type === 'local')
+      if (!profile) return this.toolErr('no_local_profile', 'no local profile configured in Tabby')
+    } catch (e: any) {
+      this.log.error(`[#${reqId}] new_tab: getProfiles failed`, e)
+      return this.toolErr('internal', e?.message ?? String(e))
+    }
+
+    let wrapper: any
+    try {
+      wrapper = await this.opts.profiles.openNewTabForProfile(profile)
+      if (!wrapper) return this.toolErr('open_failed', 'openNewTabForProfile returned null')
+    } catch (e: any) {
+      this.log.error(`[#${reqId}] new_tab: openNewTabForProfile failed`, e)
+      return this.toolErr('internal', e?.message ?? String(e))
+    }
+
+    // Wait for OUR wrapper's child to register. Matching by component reference
+    // (not by "first id we haven't seen") so concurrent new_tab calls don't
+    // cross-latch onto each other's tabs.
+    const newId = await this.waitForWrapperRegistered(wrapper, NEW_TAB_WAIT_MS)
+    if (!newId) {
+      return this.toolErr('register_timeout', `new tab did not register within ${NEW_TAB_WAIT_MS}ms`)
+    }
+    const entry = registry.get(newId)
+    if (!entry) {
+      // Should not happen — registered then immediately disappeared.
+      return this.toolErr('internal', `tab ${newId} disappeared after registration`)
+    }
+
+    if (validatedName) {
+      // Re-check uniqueness now, since other concurrent callers may have
+      // claimed the name between our up-front check and this point.
+      const dupe = registry.list().find(e => e.id !== newId && (e.tab as any).customTitle === validatedName)
+      if (dupe) {
+        // Close the tab we just opened so a name conflict doesn't leave
+        // an orphan unnamed tab behind. app.closeTab needs the top-level
+        // entry from app.tabs (often a SplitTabComponent wrapper), not the
+        // inner terminal.
+        const topLevel = this.opts.app.tabs.find(t => t === entry.tab) ?? (entry.tab as any).parent ?? entry.tab
+        try { await this.opts.app.closeTab(topLevel as any, false) }
+        catch (e: any) { this.log.warn(`[#${reqId}] new_tab: closeTab after conflict failed: ${e?.message}`) }
+        return this.toolErr('name_in_use', `name "${validatedName}" already used by tab ${dupe.id}`, { conflicting_tab_id: dupe.id })
+      }
+      try {
+        (entry.tab as any).setTitle?.(validatedName)
+        ;(entry.tab as any).customTitle = validatedName
+        this.opts.app.emitTabsChanged()
+      } catch (e: any) {
+        this.log.warn(`[#${reqId}] new_tab: rename after open failed: ${e?.message}`)
+      }
+    }
+
+    this.log.info(`[#${reqId}] new_tab id=${newId}${validatedName ? ` name="${validatedName}"` : ''}`)
+    const result = { ok: true, tab_id: newId, name: validatedName }
+    return { structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }] }
+  }
+
+  private async waitForWrapperRegistered (wrapper: any, timeoutMs: number): Promise<string | null> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const candidates: any[] = typeof wrapper?.getAllTabs === 'function'
+        ? wrapper.getAllTabs()
+        : [wrapper]
+      for (const c of candidates) {
+        for (const e of this.opts.registry.list()) {
+          if (e.tab === c) return e.id
+        }
+      }
+      await new Promise(r => setTimeout(r, 100))
+    }
+    return null
   }
 
   private toolErr (code: string, message: string, extra?: Record<string, any>) {
