@@ -20,14 +20,25 @@ export class TabRegistry {
   private entries = new Map<string, TabEntry>()
   private byTab = new WeakMap<BaseTerminalTabComponent<any>, string>()
   private perTabSubs = new WeakMap<BaseTabComponent, Subscription>()
+  private pendingFirstOutput = new WeakSet<BaseTerminalTabComponent<any>>()
   private appSubs = new Subscription()
   private log!: Logger
 
   init (app: AppService, logSvc: LogService) {
     this.log = logSvc.create('input-broker:registry')
-    for (const t of app.tabs) this.walkTopLevel(t)
-    this.appSubs.add(app.tabOpened$.subscribe(t => this.walkTopLevel(t)))
-    this.appSubs.add(app.tabClosed$.subscribe(t => this.forgetTopLevel(t)))
+    for (const t of app.tabs) this.safeWalk(t)
+    // Wrap callbacks: an unhandled throw kills the Subject's subscription.
+    this.appSubs.add(app.tabOpened$.subscribe(t => this.safeWalk(t)))
+    this.appSubs.add(app.tabClosed$.subscribe(t => this.safeForget(t)))
+  }
+
+  private safeWalk (tab: BaseTabComponent) {
+    try { this.walkTopLevel(tab) }
+    catch (e: any) { this.log.error(`walkTopLevel failed for ${tab?.constructor?.name}: ${e?.message}`, e) }
+  }
+  private safeForget (tab: BaseTabComponent) {
+    try { this.forgetTopLevel(tab) }
+    catch (e: any) { this.log.error(`forgetTopLevel failed for ${tab?.constructor?.name}: ${e?.message}`, e) }
   }
 
   destroy () {
@@ -98,15 +109,20 @@ export class TabRegistry {
     if (!id) {
       // PTY hasn't started yet — getID() becomes valid once PTYProxy is set
       // during session.start(). First output byte = "session is alive" signal.
-      if (session.binaryOutput$ && !this.byTab.get(term)) {
+      // Guard against piling up multiple once-subs if registerIfReady fires
+      // repeatedly (rapid sessionChanged$ churn).
+      if (session.binaryOutput$ && !this.byTab.get(term) && !this.pendingFirstOutput.has(term)) {
+        this.pendingFirstOutput.add(term)
         const onceSub = session.binaryOutput$.subscribe(() => {
           onceSub.unsubscribe()
+          this.pendingFirstOutput.delete(term)
           this.registerIfReady(term)
         })
         this.perTabSubs.get(term)?.add(onceSub)
       }
       return
     }
+    this.pendingFirstOutput.delete(term)
 
     const prev = this.byTab.get(term)
     if (prev === id) return

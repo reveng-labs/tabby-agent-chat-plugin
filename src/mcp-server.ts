@@ -25,6 +25,23 @@ async function readCmdline (pid: number): Promise<string | undefined> {
   }
 }
 
+const READ_CMDLINE_CONCURRENCY = 16
+async function readCmdlinesBounded (pids: number[]): Promise<Map<number, string | undefined>> {
+  const out = new Map<number, string | undefined>()
+  let i = 0
+  const workers = Array.from(
+    { length: Math.min(READ_CMDLINE_CONCURRENCY, pids.length) },
+    async () => {
+      while (i < pids.length) {
+        const pid = pids[i++]
+        out.set(pid, await readCmdline(pid))
+      }
+    },
+  )
+  await Promise.all(workers)
+  return out
+}
+
 @Injectable({ providedIn: 'root' })
 export class McpServer {
   private srv?: Server
@@ -34,6 +51,10 @@ export class McpServer {
   private reqSeq = 0
 
   async start (registry: TabRegistry, logSvc: LogService) {
+    if (this.srv) {
+      // Already started — protect against double-init on HMR / re-construction.
+      return
+    }
     this.log = logSvc.create('input-broker')
 
     const srv = createServer((req, res) => {
@@ -72,11 +93,13 @@ export class McpServer {
   }
 
   private installShutdownHooks () {
-    // Renderer close / reload: initiate async stop() but don't block teardown.
     if (typeof window !== 'undefined') {
-      window.addEventListener('beforeunload', () => { void this.stop() })
+      window.addEventListener('beforeunload', () => {
+        // Sync cleanup first — async stop() may not finish before renderer exits.
+        try { unlinkSync(DISCOVERY_FILE) } catch { /* may not exist */ }
+        void this.stop()
+      })
     }
-    // Last-resort sync cleanup on hard process exit (async handlers won't run here).
     try {
       process.on('exit', () => {
         try { unlinkSync(DISCOVERY_FILE) } catch { /* already gone */ }
@@ -109,6 +132,7 @@ export class McpServer {
     const reqId = ++this.reqSeq
     const t0 = Date.now()
     const remote = req.socket.remoteAddress ?? '?'
+    let msg: any = null
 
     try {
       if (req.headers.authorization !== `Bearer ${this.token}`) {
@@ -127,7 +151,6 @@ export class McpServer {
         return this.tryWrite(res, 413, { ok: false, code: 'body_too_large', error: e?.message ?? 'body error' })
       }
 
-      let msg: any
       try { msg = JSON.parse(body) } catch {
         this.log.warn(`[#${reqId}] bad json (${body.length}B)`)
         return this.tryWrite(res, 400, { ok: false, code: 'bad_json', error: 'invalid json' })
@@ -146,7 +169,12 @@ export class McpServer {
       this.log.debug(`[#${reqId}] ${msg?.method} ${Date.now() - t0}ms`)
     } catch (e: any) {
       this.log.error(`[#${reqId}] unexpected`, e)
-      this.tryWrite(res, 500, { ok: false, code: 'internal', error: e?.message ?? String(e) })
+      // If we parsed a JSON-RPC message, preserve its id so clients can
+      // correlate. Otherwise return a plain envelope.
+      const body = (msg && msg.jsonrpc === '2.0')
+        ? { jsonrpc: '2.0', id: msg.id ?? null, error: { code: -32603, message: e?.message ?? 'internal error' } }
+        : { ok: false, code: 'internal', error: e?.message ?? String(e) }
+      this.tryWrite(res, 500, body)
     }
   }
 
@@ -173,14 +201,30 @@ export class McpServer {
       })
       req.on('error', fail)
       req.on('aborted', () => fail(new Error('aborted')))
+      // Node 17+ deprecated 'aborted' in favor of socket 'close' fired when
+      // the connection drops before req emits 'end'.
+      req.on('close', () => {
+        if (!settled && !req.complete) fail(new Error('connection closed before body complete'))
+      })
     })
   }
 
   private tryWrite (res: ServerResponse, status: number, body: any) {
     if (res.writableEnded || res.headersSent) return
+    // Serialize FIRST. If stringify throws (BigInt, circular ref), we still
+    // have a chance to send a meaningful error instead of a half-sent response.
+    let serialized: string
+    try {
+      serialized = JSON.stringify(body)
+    } catch (e: any) {
+      this.log.warn(`response serialize failed: ${e?.message}`)
+      try { serialized = JSON.stringify({ ok: false, code: 'serialize_failed', error: String(e?.message ?? e) }) }
+      catch { serialized = '{"ok":false,"code":"serialize_failed"}' }
+      status = 500
+    }
     try {
       res.writeHead(status, { 'content-type': 'application/json' })
-      res.end(JSON.stringify(body))
+      res.end(serialized)
     } catch (e: any) {
       this.log.warn(`response write failed: ${e?.message}`)
     }
@@ -265,12 +309,14 @@ export class McpServer {
       if (typeof session?.getChildProcesses === 'function') {
         try {
           const raw: any[] = await this.withTimeout<any[]>(session.getChildProcesses(), CHILD_PROC_TIMEOUT_MS)
-          processes = await Promise.all(raw.map(async (p: any) => ({
+          const pids = raw.map((p: any) => Number(p.pid))
+          const cmdlines = await readCmdlinesBounded(pids)
+          processes = raw.map((p: any) => ({
             pid: Number(p.pid),
             ppid: Number(p.ppid),
             command: String(p.command ?? ''),
-            cmdline: await readCmdline(Number(p.pid)),
-          })))
+            cmdline: cmdlines.get(Number(p.pid)),
+          }))
         } catch (err: any) {
           processes_error = err?.message ?? String(err)
           this.log.warn(`[#${reqId}] getChildProcesses(${e.id}) failed: ${processes_error}`)
@@ -310,7 +356,10 @@ export class McpServer {
       return this.toolErr('tab_not_ready', `tab ${args.tab_id} has no active session`)
     }
 
-    const supportsBP = (entry.tab.frontend as any)?.supportsBracketedPaste?.() ?? false
+    const fe: any = entry.tab.frontend
+    const supportsBP = typeof fe?.supportsBracketedPaste === 'function'
+      ? !!fe.supportsBracketedPaste()
+      : false
     const useBrackets =
       reqMode === 'paste' ? true
         : reqMode === 'keystrokes' ? false
