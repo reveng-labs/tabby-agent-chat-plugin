@@ -60,6 +60,13 @@ export class McpServer {
     this.port = (srv.address() as any).port
     this.log.info(`listening on http://127.0.0.1:${this.port} (token hidden; see ${DISCOVERY_FILE})`)
 
+    // Inject discovery vars into the renderer's env so every shell Tabby
+    // spawns afterwards inherits them. Existing shells were spawned with
+    // the old env (or none) and won't see this until restarted.
+    process.env.TABBY_BRIDGE_URL = `http://127.0.0.1:${this.port}/mcp`
+    process.env.TABBY_BRIDGE_TOKEN = this.token
+    this.log.info(`exported TABBY_BRIDGE_URL and TABBY_BRIDGE_TOKEN to renderer env (inherited by new shells)`)
+
     await this.writeDiscoveryFile()
     this.installShutdownHooks()
   }
@@ -80,6 +87,8 @@ export class McpServer {
   async stop () {
     if (!this.srv) return
     this.log.info('stopping http server')
+    delete process.env.TABBY_BRIDGE_URL
+    delete process.env.TABBY_BRIDGE_TOKEN
     try { await fs.unlink(DISCOVERY_FILE) } catch { /* file may not exist */ }
     const srv = this.srv
     this.srv = undefined
