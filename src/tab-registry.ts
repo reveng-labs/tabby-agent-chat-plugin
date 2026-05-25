@@ -134,6 +134,29 @@ export class TabRegistry {
     this.entries.set(id, { id, tab: term })
     this.byTab.set(term, id)
     this.log.info(`registered tab ${id} (${term.title})`)
+
+    // Inject Tabby's own session id into the shell's env via stdin so it
+    // ends up in /proc/<pid>/environ inside the running shell (including
+    // bash inside WSL, where renderer-side WSLENV can't reach because the
+    // shell is in a different process namespace from the wsl.exe launcher).
+    // We use shell-command injection rather than monkey-patching profile
+    // env — works across Linux/macOS/WSL the same way.
+    this.injectTabId(term, id)
+  }
+
+  private injectTabId (term: BaseTerminalTabComponent<any>, id: string) {
+    try {
+      // POSIX shell syntax: export X='UUID'. UUIDs contain only [0-9a-f-],
+      // so single-quoting is safe.
+      const cmd = `export TABBY_AGENT_CHAT_TAB_ID='${id}'`
+      const supportsBP = !!(term.frontend as any)?.supportsBracketedPaste?.()
+      const payload = supportsBP
+        ? `\x1b[200~${cmd}\x1b[201~\r`
+        : `${cmd}\r`
+      term.sendInput(Buffer.from(payload, 'utf8'))
+    } catch (e: any) {
+      this.log.warn(`injectTabId(${id}) failed: ${e?.message}`)
+    }
   }
 
   private unregisterTerminal (tab: BaseTabComponent) {
