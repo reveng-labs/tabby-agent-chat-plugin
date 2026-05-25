@@ -425,7 +425,7 @@ export class McpServer {
     return [
       {
         name: 'list_tabs',
-        description: 'List Tabby tabs in this window with running processes. Returns each tab\'s id (use with send_to_tab/rename_tab), name (what the user sees on the tab header — custom name if set, otherwise auto-title), and process list.',
+        description: 'List Tabby tabs in this window with running processes. Returns each tab\'s id (always present — use with send_to_tab/rename_tab), name (the explicitly-set custom name, or null if none), and process list.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       },
       {
@@ -510,16 +510,17 @@ export class McpServer {
         }
       }
 
-      // Read displayed name from the top-level tab (where the UI's Rename
-      // sets customTitle). The inner terminal's customTitle/title only show
-      // the bash OSC title like "user@host: ~", which doesn't match what the
-      // user sees in the tab header.
+      // `name` reflects only an explicitly-set label (via Tabby's UI
+      // Rename or our rename_tab). The shell's auto-title (OSC) is dynamic
+      // and noisy — not useful as a stable identifier, so we don't fall
+      // back to it. Consumers needing a guaranteed-non-null handle should
+      // use `id`.
       const top = topLevelTab(e.tab)
-      const customTitle = ((top as any).customTitle as string | undefined) ?? ''
-      const name = customTitle || (top.title ?? e.tab.title ?? '')
+      const customTitle = (top as any).customTitle as string | undefined
+      const name = customTitle && customTitle.length > 0 ? customTitle : null
       return {
         id: e.id,
-        name,                                                   // what the user sees on the tab header
+        name,
         processes,
         ...(processes_error ? { processes_error } : {}),
       }
@@ -604,8 +605,9 @@ export class McpServer {
     }
 
     try {
+      // Only set customTitle. Leave `title` alone — it's shell-controlled
+      // (OSC) and the UI/template prefers customTitle when present anyway.
       const top = topLevelTab(entry.tab)
-      top.setTitle?.(v.name)
       top.customTitle = v.name
       this.opts.app.emitTabsChanged()
     } catch (e: any) {
@@ -683,8 +685,8 @@ export class McpServer {
         return this.toolErr('name_in_use', `name "${validatedName}" already used by tab ${dupe.id}`, { conflicting_tab_id: dupe.id })
       }
       try {
+        // customTitle only — see toolRename for rationale.
         const top = topLevelTab(entry.tab)
-        top.setTitle?.(validatedName)
         top.customTitle = validatedName
         this.opts.app.emitTabsChanged()
       } catch (e: any) {

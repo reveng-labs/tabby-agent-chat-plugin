@@ -52,11 +52,12 @@ at runtime.
 
 * `list_tabs` — returns every terminal tab in the current Tabby window.
   Each entry has:
-    - `id`        stable string id for the tab (use with `send_to_tab`
-                  and `rename_tab`)
-    - `name`      what the user sees on the tab header: the custom name
-                  if one was set (via Tabby's Rename or `rename_tab`),
-                  otherwise the auto-title derived from the shell
+    - `id`        stable string id for the tab — always present, use
+                  with `send_to_tab` and `rename_tab`
+    - `name`      the explicitly-set custom name (via Tabby's Rename
+                  right-click or `rename_tab`), or `null` if no custom
+                  name was set. The shell's dynamic OSC title is *not*
+                  used as a fallback because it's noisy.
     - `processes` `[{pid, ppid, command, cmdline?}]` — the full process
                   tree running in the tab. `cmdline` reveals which
                   agent is running (e.g. `node …/codex`, `claude`)
