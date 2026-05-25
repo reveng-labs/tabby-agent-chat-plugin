@@ -1,7 +1,8 @@
 name: Release
 
 # Triggered by pushing a tag of the form v1.2.3.
-# Workflow: install deps -> build (webpack) -> publish to npm -> create GitHub Release.
+# Workflow: install deps -> build (webpack) -> publish to npm via Trusted
+# Publishing (OIDC, no token) -> create GitHub Release.
 # Build happens in the runner, never on your local machine.
 
 on:
@@ -14,6 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write   # for creating the GitHub Release
+      id-token: write   # for npm OIDC Trusted Publishing
 
     steps:
       - uses: actions/checkout@v4
@@ -33,13 +35,17 @@ jobs:
             exit 1
           fi
 
+      # Trusted Publishing requires npm CLI >= 11.5.1 — the Node 20 default is 10.x.
+      - run: npm install -g npm@latest
+
       - run: npm ci
       - run: npm run build
 
+      # No NODE_AUTH_TOKEN — npm CLI does an OIDC exchange with the
+      # registry, which validates this workflow against the Trusted
+      # Publisher configured on npmjs.com for `tabby-agent-chat`.
       - name: Publish to npm
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
