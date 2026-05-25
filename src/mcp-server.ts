@@ -12,7 +12,18 @@ const MAX_TEXT_BYTES = 64 * 1024                // per send_to_tab payload
 const CHILD_PROC_TIMEOUT_MS = 1000              // bound list_tabs latency
 const DISCOVERY_FILE = path.join(homedir(), '.config', 'tabby', 'input-broker.json')
 
-interface RawProc { pid: number; ppid: number; command: string }
+interface RawProc { pid: number; ppid: number; command: string; cmdline?: string }
+
+async function readCmdline (pid: number): Promise<string | undefined> {
+  if (process.platform !== 'linux') return undefined
+  try {
+    const buf = await fs.readFile(`/proc/${pid}/cmdline`)
+    // argv is NUL-separated, often with a trailing NUL
+    return buf.toString('utf8').replace(/\0+$/, '').replace(/\0/g, ' ')
+  } catch {
+    return undefined  // process gone, perms, /proc not mounted, etc.
+  }
+}
 
 @Injectable({ providedIn: 'root' })
 export class McpServer {
@@ -244,12 +255,13 @@ export class McpServer {
       const session: any = e.tab.session
       if (typeof session?.getChildProcesses === 'function') {
         try {
-          processes = await this.withTimeout(session.getChildProcesses(), CHILD_PROC_TIMEOUT_MS)
-          processes = processes.map(p => ({
+          const raw: any[] = await this.withTimeout<any[]>(session.getChildProcesses(), CHILD_PROC_TIMEOUT_MS)
+          processes = await Promise.all(raw.map(async (p: any) => ({
             pid: Number(p.pid),
             ppid: Number(p.ppid),
             command: String(p.command ?? ''),
-          }))
+            cmdline: await readCmdline(Number(p.pid)),
+          })))
         } catch (err: any) {
           processes_error = err?.message ?? String(err)
           this.log.warn(`[#${reqId}] getChildProcesses(${e.id}) failed: ${processes_error}`)
