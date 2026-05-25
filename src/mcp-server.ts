@@ -2,16 +2,16 @@ import { Injectable } from '@angular/core'
 import { AddressInfo } from 'net'
 import { createServer, IncomingMessage, Server, ServerResponse } from 'http'
 import { randomUUID } from 'crypto'
-import { promises as fs } from 'fs'
 import { spawn } from 'child_process'
 import * as path from 'path'
 import { AppService, LogService, Logger, ProfilesService } from 'tabby-core'
-import { TabRegistry } from './tab-registry'
+import { TabRegistry, TAB_ID_ENV_KEY } from './tab-registry'
+import { enumerateLocalTree, RawProc } from './process-tree'
 import pkg from '../package.json'
 
 const MAX_BODY_BYTES = 1024 * 1024              // 1 MB hard cap
 const MAX_TEXT_BYTES = 64 * 1024                // per send_to_tab payload
-const CHILD_PROC_TIMEOUT_MS = 1000              // bound list_tabs latency
+const PROC_TREE_TIMEOUT_MS = 2000               // bound list_tabs latency per tab
 const MAX_TAB_NAME_LEN = 64                     // tab name length cap
 const MAX_TABS = 64                             // fork-bomb cap for new_tab
 const NEW_TAB_WAIT_MS = 15000                   // wait for new tab to register (high under load)
@@ -112,34 +112,14 @@ EXAMPLE USE CASE — when the user asks "send X to the agent doing Y":
      Other tools: consult their respective docs.
 3. send_to_tab(tab_id, "X") to that tab.`
 
-interface RawProc { pid: number; ppid: number; command: string; cmdline?: string }
-
-async function readCmdline (pid: number): Promise<string | undefined> {
-  if (process.platform !== 'linux') return undefined
-  try {
-    const buf = await fs.readFile(`/proc/${pid}/cmdline`)
-    // argv is NUL-separated, often with a trailing NUL
-    return buf.toString('utf8').replace(/\0+$/, '').replace(/\0/g, ' ')
-  } catch {
-    return undefined  // process gone, perms, /proc not mounted, etc.
-  }
-}
-
-const READ_CMDLINE_CONCURRENCY = 16
-async function readCmdlinesBounded (pids: number[]): Promise<Map<number, string | undefined>> {
-  const out = new Map<number, string | undefined>()
-  let i = 0
-  const workers = Array.from(
-    { length: Math.min(READ_CMDLINE_CONCURRENCY, pids.length) },
-    async () => {
-      while (i < pids.length) {
-        const pid = pids[i++]
-        out.set(pid, await readCmdline(pid))
-      }
-    },
-  )
-  await Promise.all(workers)
-  return out
+// Best-effort: does this profile's spawned process front a WSL distro?
+// Tabby on Windows treats `wsl.exe` like a normal program; we treat any tab
+// whose command basename starts with "wsl" (case-insensitive) as a WSL tab.
+function isWslTab (tab: any): boolean {
+  if (process.platform !== 'win32') return false
+  const cmd: string = tab?.profile?.options?.command ?? ''
+  const base = (cmd.split(/[\\/]/).pop() || '').toLowerCase()
+  return /^wsl(\.exe)?$/.test(base)
 }
 
 export interface StartOptions {
@@ -208,16 +188,19 @@ export class McpServer {
     process.env.TABBY_AGENT_CHAT_URL = `http://127.0.0.1:${this.port}/mcp`
     process.env.TABBY_AGENT_CHAT_TOKEN = this.token
     process.env.TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS = INSTALL_FILE
-    // Tell WSL to inherit our three vars. The INSTALL path gets the /p flag
-    // so wsl.exe translates "C:\\…\\INSTALL.md" to "/mnt/c/…/INSTALL.md".
-    // Other vars are plain strings (URL, opaque token). Preserve any
-    // pre-existing WSLENV entries the user or other tooling set.
+    // Tell WSL to inherit our vars. The INSTALL path gets the /p flag so
+    // wsl.exe translates "C:\\…\\INSTALL.md" to "/mnt/c/…/INSTALL.md". Other
+    // vars are plain strings (URL, opaque token, per-tab id). Per-tab id is
+    // set on profile.options.env by the registry, but WSLENV controls *which*
+    // env names cross the boundary, so it has to be listed globally here.
+    // Preserve any pre-existing WSLENV entries the user or other tooling set.
     this.addToWslenv([
       'TABBY_AGENT_CHAT_URL',
       'TABBY_AGENT_CHAT_TOKEN',
       'TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS/p',
+      TAB_ID_ENV_KEY,
     ])
-    this.log.info(`exported TABBY_AGENT_CHAT_URL, _TOKEN, _INSTALL_INSTRUCTIONS (incl. WSLENV propagation)`)
+    this.log.info(`exported TABBY_AGENT_CHAT_URL, _TOKEN, _INSTALL_INSTRUCTIONS, _TAB_ID (incl. WSLENV propagation)`)
 
     this.installShutdownHooks()
   }
@@ -226,6 +209,7 @@ export class McpServer {
     'TABBY_AGENT_CHAT_URL',
     'TABBY_AGENT_CHAT_TOKEN',
     'TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS',
+    TAB_ID_ENV_KEY,
   ])
 
   private addToWslenv (entries: string[]) {
@@ -484,40 +468,35 @@ export class McpServer {
     const tabs = await Promise.all(registry.list().map(async e => {
       let processes: RawProc[] = []
       let processes_error: string | undefined
-      const session: any = e.tab.session
-      if (typeof session?.getChildProcesses === 'function') {
+
+      // On Windows + WSL tab: the Windows-side process tree dead-ends at
+      // wsl.exe. Cross the boundary by querying /proc inside WSL and
+      // matching back via the injected TABBY_AGENT_CHAT_TAB_ID. The marker
+      // is set on profile.options.env at tabOpened$ time so it appears in
+      // /proc/<init>/environ inside WSL.
+      const wsl = isWslTab(e.tab)
+      if (wsl) {
         try {
-          const raw: any[] = await this.withTimeout<any[]>(session.getChildProcesses(), CHILD_PROC_TIMEOUT_MS)
-          const pids = raw.map((p: any) => Number(p.pid))
-          const cmdlines = await readCmdlinesBounded(pids)
-          processes = raw.map((p: any) => ({
-            pid: Number(p.pid),
-            ppid: Number(p.ppid),
-            command: String(p.command ?? ''),
-            cmdline: cmdlines.get(Number(p.pid)),
-          }))
+          processes = await queryWslProcessesByTabId(e.id, WSL_QUERY_TIMEOUT_MS)
         } catch (err: any) {
           processes_error = err?.message ?? String(err)
-          this.log.warn(`[#${reqId}] getChildProcesses(${e.id}) failed: ${processes_error}`)
+          this.log.warn(`[#${reqId}] wsl query for tab ${e.id} failed: ${processes_error}`)
         }
       }
 
-      // On Windows, the Windows-side process tree dead-ends at wsl.exe for
-      // WSL tabs. Cross the boundary by querying /proc inside WSL and
-      // matching back to this tab via the injected TABBY_AGENT_CHAT_TAB_ID.
-      // If the marker isn't found (non-WSL tab, or tab spawned before our
-      // injector ran), the query returns empty and we keep the Windows-side
-      // results.
-      if (process.platform === 'win32') {
-        try {
-          const wslProcs = await queryWslProcessesByTabId(e.id, WSL_QUERY_TIMEOUT_MS)
-          if (wslProcs.length > 0) {
-            processes = wslProcs   // replace useless Windows-side helpers with the real WSL tree
+      // Non-WSL: walk the local OS process tree from the tab's truePID. Also
+      // used as a fallback for WSL tabs where the cross-boundary query
+      // returned nothing (e.g., distro not started, marker not propagated
+      // because the tab was recovered from a prior session).
+      if (processes.length === 0) {
+        const truePID = await this.tabTruePID(e.tab)
+        if (truePID != null) {
+          try {
+            processes = await enumerateLocalTree(truePID, PROC_TREE_TIMEOUT_MS)
+          } catch (err: any) {
+            processes_error = err?.message ?? String(err)
+            this.log.warn(`[#${reqId}] enumerateLocalTree(${truePID}) failed: ${processes_error}`)
           }
-        } catch (err: any) {
-          // Common: no WSL installed, or wsl.exe not on PATH — leave a soft
-          // warning, don't fail the whole list_tabs call.
-          this.log.warn(`[#${reqId}] wsl query for tab ${e.id} failed: ${err?.message}`)
         }
       }
 
@@ -731,6 +710,25 @@ export class McpServer {
       const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)
       p.then(v => { clearTimeout(timer); resolve(v) }, e => { clearTimeout(timer); reject(e) })
     })
+  }
+
+  // Tabby's PTYProxy exposes both getPID (the wrapper) and getTruePID (the
+  // actual shell). UAC-elevated sessions wrap the shell in a helper; trueid
+  // skips the helper. Returns null if the session is gone.
+  private async tabTruePID (tab: any): Promise<number | null> {
+    try {
+      const pty = tab?.session?.pty
+      if (!pty) return null
+      const raw = typeof pty.getTruePID === 'function'
+        ? await pty.getTruePID()
+        : await pty.getPID()
+      // Tabby occasionally hands these back as strings (IPC stringification);
+      // coerce before sanity-checking.
+      const pid = Number(raw)
+      return Number.isFinite(pid) && pid > 0 ? pid : null
+    } catch {
+      return null
+    }
   }
 
 }

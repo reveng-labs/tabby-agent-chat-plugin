@@ -1,7 +1,10 @@
 import { Injectable } from '@angular/core'
 import { Subscription } from 'rxjs'
+import { randomUUID } from 'crypto'
 import { AppService, BaseTabComponent, LogService, Logger } from 'tabby-core'
 import { BaseTerminalTabComponent } from 'tabby-terminal'
+
+export const TAB_ID_ENV_KEY = 'TABBY_AGENT_CHAT_TAB_ID'
 
 // Duck-type a SplitTabComponent without referencing the class directly.
 // We're loaded as an external module, so `instanceof` against tabby-core's
@@ -20,7 +23,6 @@ export class TabRegistry {
   private entries = new Map<string, TabEntry>()
   private byTab = new WeakMap<BaseTerminalTabComponent<any>, string>()
   private perTabSubs = new WeakMap<BaseTabComponent, Subscription>()
-  private pendingFirstOutput = new WeakSet<BaseTerminalTabComponent<any>>()
   private appSubs = new Subscription()
   private log!: Logger
 
@@ -92,78 +94,42 @@ export class TabRegistry {
     if (!(tab as any).sessionChanged$) return
     const term = tab as BaseTerminalTabComponent<any>
 
-    this.perTabSubs.get(term)?.unsubscribe()
+    // Idempotent: don't regenerate UUID or re-inject env if we've seen this
+    // component before (split-tab walk can revisit children).
+    if (this.byTab.has(term)) return
 
-    const sub = new Subscription()
-    sub.add(term.sessionChanged$.subscribe(() => this.registerIfReady(term)))
-    sub.add(term.destroyed$.subscribe(() => this.unregisterTerminal(term)))
-    this.perTabSubs.set(term, sub)
-
-    this.registerIfReady(term)
-  }
-
-  private registerIfReady (term: BaseTerminalTabComponent<any>) {
-    const session: any = term.session
-    if (!session || typeof session.getID !== 'function') return
-    const id = session.getID()
-    if (!id) {
-      // PTY hasn't started yet — getID() becomes valid once PTYProxy is set
-      // during session.start(). First output byte = "session is alive" signal.
-      // Guard against piling up multiple once-subs if registerIfReady fires
-      // repeatedly (rapid sessionChanged$ churn).
-      if (session.binaryOutput$ && !this.byTab.get(term) && !this.pendingFirstOutput.has(term)) {
-        this.pendingFirstOutput.add(term)
-        const onceSub = session.binaryOutput$.subscribe(() => {
-          onceSub.unsubscribe()
-          this.pendingFirstOutput.delete(term)
-          this.registerIfReady(term)
-        })
-        this.perTabSubs.get(term)?.add(onceSub)
-      }
-      return
+    // tabOpened$ fires inside addTabRaw, BEFORE Angular's resize$ → onFrontendReady →
+    // initializeSession → session.start({...this.profile.options, ...}) chain.
+    // Each tab's profile is a deepClone (tabby-local/src/profiles.ts:51), so
+    // mutating profile.options.env here only affects this tab. Race-free even
+    // for burst opens. Captured into spawn env by the spread inside session.start.
+    const id = randomUUID()
+    const profile: any = term.profile
+    // Tabby exposes `profile.options` and `profile.options.env` as getters
+    // that proxy into a FullyDefined builder — we can mutate the *returned*
+    // object but can't reassign the properties themselves. `env` defaults to
+    // an empty object so we can rely on it being there for local profiles.
+    const env = profile?.options?.env
+    if (env && typeof env === 'object') {
+      env[TAB_ID_ENV_KEY] = id
+    } else {
+      this.log.warn(`tab ${term.constructor?.name} has no profile.options.env; tab id not injected for ${id}`)
     }
-    this.pendingFirstOutput.delete(term)
 
-    const prev = this.byTab.get(term)
-    if (prev === id) return
-    if (prev) this.entries.delete(prev)
-
-    if (this.entries.has(id)) {
-      this.log.warn(`duplicate session id ${id}; overwriting`)
-    }
     this.entries.set(id, { id, tab: term })
     this.byTab.set(term, id)
-    this.log.info(`registered tab ${id} (${term.title})`)
+    this.log.info(`registered tab ${id} (${term.title || '<no title>'})`)
 
-    // Inject Tabby's own session id into the shell's env via stdin so it
-    // ends up in /proc/<pid>/environ inside the running shell (including
-    // bash inside WSL, where renderer-side WSLENV can't reach because the
-    // shell is in a different process namespace from the wsl.exe launcher).
-    // We use shell-command injection rather than monkey-patching profile
-    // env — works across Linux/macOS/WSL the same way.
-    this.injectTabId(term, id)
-  }
-
-  private injectTabId (term: BaseTerminalTabComponent<any>, id: string) {
-    try {
-      // POSIX shell syntax: export X='UUID'. UUIDs contain only [0-9a-f-],
-      // so single-quoting is safe.
-      const cmd = `export TABBY_AGENT_CHAT_TAB_ID='${id}'`
-      const supportsBP = !!(term.frontend as any)?.supportsBracketedPaste?.()
-      const payload = supportsBP
-        ? `\x1b[200~${cmd}\x1b[201~\r`
-        : `${cmd}\r`
-      term.sendInput(Buffer.from(payload, 'utf8'))
-    } catch (e: any) {
-      this.log.warn(`injectTabId(${id}) failed: ${e?.message}`)
-    }
+    // Auto-cleanup on tab destruction.
+    const sub = new Subscription()
+    sub.add(term.destroyed$.subscribe(() => this.unregisterTerminal(term)))
+    this.perTabSubs.set(term, sub)
   }
 
   private unregisterTerminal (tab: BaseTabComponent) {
     this.perTabSubs.get(tab)?.unsubscribe()
     this.perTabSubs.delete(tab)
     const term = tab as BaseTerminalTabComponent<any>
-    this.pendingFirstOutput.delete(term)
     const id = this.byTab.get(term)
     if (id) {
       this.entries.delete(id)
