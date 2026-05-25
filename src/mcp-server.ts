@@ -6,6 +6,7 @@ import { promises as fs } from 'fs'
 import * as path from 'path'
 import { LogService, Logger } from 'tabby-core'
 import { TabRegistry } from './tab-registry'
+import pkg from '../package.json'
 
 const MAX_BODY_BYTES = 1024 * 1024              // 1 MB hard cap
 const MAX_TEXT_BYTES = 64 * 1024                // per send_to_tab payload
@@ -276,7 +277,7 @@ export class McpServer {
     if (msg.method === 'initialize') {
       return reply({
         protocolVersion: '2025-06-18',
-        serverInfo: { name: 'tabby-agent-chat', version: '0.1.0' },
+        serverInfo: { name: pkg.name, version: pkg.version },
         capabilities: { tools: {} },
         instructions: SERVER_INSTRUCTIONS,
       })

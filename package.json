@@ -1,6 +1,6 @@
 {
   "name": "tabby-agent-chat",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Agent Chat for Tabby — exposes terminal tabs over MCP so an AI agent in one tab can send input to another",
   "keywords": ["tabby-plugin"],
   "author": "tabby-agent-chat contributors",
