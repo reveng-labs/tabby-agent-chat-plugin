@@ -2,8 +2,7 @@ import { Injectable } from '@angular/core'
 import { AddressInfo } from 'net'
 import { createServer, IncomingMessage, Server, ServerResponse } from 'http'
 import { randomUUID } from 'crypto'
-import { promises as fs, unlinkSync } from 'fs'
-import { homedir } from 'os'
+import { promises as fs } from 'fs'
 import * as path from 'path'
 import { LogService, Logger } from 'tabby-core'
 import { TabRegistry } from './tab-registry'
@@ -11,7 +10,6 @@ import { TabRegistry } from './tab-registry'
 const MAX_BODY_BYTES = 1024 * 1024              // 1 MB hard cap
 const MAX_TEXT_BYTES = 64 * 1024                // per send_to_tab payload
 const CHILD_PROC_TIMEOUT_MS = 1000              // bound list_tabs latency
-const DISCOVERY_FILE = path.join(homedir(), '.config', 'tabby', 'agent-chat.json')
 // INSTALL.md ships with the plugin. dist/index.js sits at
 // <install>/dist/index.js, so the markdown is one dir up.
 const INSTALL_FILE = path.resolve(__dirname, '..', 'INSTALL.md')
@@ -74,7 +72,6 @@ export class McpServer {
   private log!: Logger
   private reqSeq = 0
   private starting?: Promise<void>
-  private exitHandler?: () => void
 
   async start (registry: TabRegistry, logSvc: LogService): Promise<void> {
     // Protect against concurrent or repeated calls: both same-tick callers
@@ -116,7 +113,7 @@ export class McpServer {
     }
     this.srv = srv
     this.port = (addr as AddressInfo).port
-    this.log.info(`listening on http://127.0.0.1:${this.port} (token hidden; see ${DISCOVERY_FILE})`)
+    this.log.info(`listening on http://127.0.0.1:${this.port} (token hidden; see env TABBY_AGENT_CHAT_TOKEN)`)
 
     // Inject discovery vars into the renderer's env so every shell Tabby
     // spawns afterwards inherits them. Existing shells were spawned with
@@ -126,28 +123,12 @@ export class McpServer {
     process.env.TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS = INSTALL_FILE
     this.log.info(`exported TABBY_AGENT_CHAT_URL, _TOKEN, _INSTALL_INSTRUCTIONS to renderer env`)
 
-    await this.writeDiscoveryFile()
     this.installShutdownHooks()
   }
 
   private installShutdownHooks () {
     if (typeof window !== 'undefined') {
-      window.addEventListener('beforeunload', () => {
-        // Sync cleanup first — async stop() may not finish before renderer exits.
-        this.unlinkDiscoverySync()
-        void this.stop()
-      })
-    }
-    try {
-      this.exitHandler = () => this.unlinkDiscoverySync()
-      process.once('exit', this.exitHandler)
-    } catch { /* not a Node-integrated context */ }
-  }
-
-  private unlinkDiscoverySync () {
-    try { unlinkSync(DISCOVERY_FILE) }
-    catch (e: any) {
-      if (e?.code !== 'ENOENT') this.log?.warn?.(`unlinkSync(discovery): ${e?.message}`)
+      window.addEventListener('beforeunload', () => { void this.stop() })
     }
   }
 
@@ -157,13 +138,6 @@ export class McpServer {
     delete process.env.TABBY_AGENT_CHAT_URL
     delete process.env.TABBY_AGENT_CHAT_TOKEN
     delete process.env.TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS
-    try { await fs.unlink(DISCOVERY_FILE) }
-    catch (e: any) { if (e?.code !== 'ENOENT') this.log.warn(`unlink(discovery): ${e?.message}`) }
-    // INSTALL_FILE is part of the plugin package — don't unlink.
-    if (this.exitHandler) {
-      try { process.removeListener('exit', this.exitHandler) } catch { /* not a Node context */ }
-      this.exitHandler = undefined
-    }
     const srv = this.srv
     this.srv = undefined
     // Drop keep-alives first so close() can resolve even if a handler held a socket open.
@@ -461,26 +435,4 @@ export class McpServer {
     })
   }
 
-  private async writeDiscoveryFile () {
-    try {
-      await fs.mkdir(path.dirname(DISCOVERY_FILE), { recursive: true })
-      // unlink first: fs.writeFile honours `mode` only on file creation,
-      // so a pre-existing 0644 (e.g., from a foreign-uid prior run) would
-      // not be tightened. Removing-then-writing guarantees 0600.
-      try { await fs.unlink(DISCOVERY_FILE) }
-      catch (e: any) {
-        if (e?.code !== 'ENOENT') this.log.warn(`pre-write unlink: ${e?.message}`)
-      }
-      const payload = JSON.stringify({
-        pid: process.pid,
-        port: this.port,
-        token: this.token,
-        url: `http://127.0.0.1:${this.port}/mcp`,
-      }, null, 2)
-      await fs.writeFile(DISCOVERY_FILE, payload, { mode: 0o600 })
-      this.log.info(`discovery file at ${DISCOVERY_FILE} (mode 0600)`)
-    } catch (e: any) {
-      this.log.warn(`could not write discovery file: ${e?.message}`)
-    }
-  }
 }

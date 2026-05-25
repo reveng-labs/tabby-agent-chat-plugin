@@ -18,8 +18,6 @@ shell spawned inside Tabby after the plugin loads):
     TABBY_AGENT_CHAT_URL    full http://127.0.0.1:PORT/mcp URL
     TABBY_AGENT_CHAT_TOKEN  bearer token
 
-The same info is also in `~/.config/tabby/agent-chat.json`.
-
 ## Installation
 
 Run the command for whichever agent CLI you're using. Both commands use
