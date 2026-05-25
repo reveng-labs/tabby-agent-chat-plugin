@@ -98,9 +98,9 @@ export class McpServer {
     // Inject discovery vars into the renderer's env so every shell Tabby
     // spawns afterwards inherits them. Existing shells were spawned with
     // the old env (or none) and won't see this until restarted.
-    process.env.TABBY_BRIDGE_URL = `http://127.0.0.1:${this.port}/mcp`
-    process.env.TABBY_BRIDGE_TOKEN = this.token
-    this.log.info(`exported TABBY_BRIDGE_URL and TABBY_BRIDGE_TOKEN to renderer env (inherited by new shells)`)
+    process.env.TABBY_AGENT_CHAT_URL = `http://127.0.0.1:${this.port}/mcp`
+    process.env.TABBY_AGENT_CHAT_TOKEN = this.token
+    this.log.info(`exported TABBY_AGENT_CHAT_URL and TABBY_AGENT_CHAT_TOKEN to renderer env (inherited by new shells)`)
 
     await this.writeDiscoveryFile()
     this.installShutdownHooks()
@@ -130,8 +130,8 @@ export class McpServer {
   async stop () {
     if (!this.srv) return
     this.log.info('stopping http server')
-    delete process.env.TABBY_BRIDGE_URL
-    delete process.env.TABBY_BRIDGE_TOKEN
+    delete process.env.TABBY_AGENT_CHAT_URL
+    delete process.env.TABBY_AGENT_CHAT_TOKEN
     try { await fs.unlink(DISCOVERY_FILE) }
     catch (e: any) { if (e?.code !== 'ENOENT') this.log.warn(`unlink(discovery): ${e?.message}`) }
     if (this.exitHandler) {
