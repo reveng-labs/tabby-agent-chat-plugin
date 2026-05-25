@@ -13,6 +13,27 @@ const MAX_TEXT_BYTES = 64 * 1024                // per send_to_tab payload
 const CHILD_PROC_TIMEOUT_MS = 1000              // bound list_tabs latency
 const DISCOVERY_FILE = path.join(homedir(), '.config', 'tabby', 'agent-chat.json')
 
+const SERVER_INSTRUCTIONS = `This server exposes terminal tabs in the current Tabby window for
+agent-to-agent messaging.
+
+WORKFLOW:
+1. Call list_tabs → each tab has id, title, and processes (with cmdline).
+2. Identify the target agent by inspecting cmdline of the processes in
+   each tab. Examples: "node …/codex" = Codex; "claude" = Claude Code;
+   "node …/aider" = Aider.
+3. Call send_to_tab(tab_id, text) → injects text into the target's
+   stdin as if typed.
+
+NOTES:
+- Default mode auto-detects bracketed-paste support. Pass
+  mode: "keystrokes" for raw control bytes (Ctrl-C = \\x03).
+- Tab ids are stable for the session's lifetime; reuse across calls.
+- Only local terminal tabs are addressable. SSH, serial, and telnet
+  sessions are not visible.
+- Each Tabby window runs its own server; tabs in other windows are
+  unreachable.
+- Do not send to your own tab — you would echo yourself.`
+
 interface RawProc { pid: number; ppid: number; command: string; cmdline?: string }
 
 async function readCmdline (pid: number): Promise<string | undefined> {
@@ -278,6 +299,7 @@ export class McpServer {
         protocolVersion: '2025-06-18',
         serverInfo: { name: 'tabby-agent-chat', version: '0.1.0' },
         capabilities: { tools: {} },
+        instructions: SERVER_INSTRUCTIONS,
       })
     }
     // Any JSON-RPC notification (no `id`) — or anything in the notifications/*
