@@ -227,7 +227,8 @@ export class McpServer {
             tab_id: { type: 'string', minLength: 1, maxLength: 128 },
             text:   { type: 'string', maxLength: MAX_TEXT_BYTES },
             submit: { type: 'boolean', default: true },
-            mode:   { type: 'string', enum: ['paste', 'keystrokes'], default: 'paste' },
+            mode:   { type: 'string', enum: ['auto', 'paste', 'keystrokes'], default: 'auto',
+                    description: '"auto" (default) reads the target tab\'s bracketed-paste support from xterm.js and wraps only when supported. "paste" forces wrapping. "keystrokes" sends raw bytes.' },
           },
         },
       },
@@ -273,7 +274,10 @@ export class McpServer {
       return this.toolErr('invalid_args', `text exceeds ${MAX_TEXT_BYTES} chars`)
     }
     const submit: boolean = args.submit ?? true
-    const mode: 'paste'|'keystrokes' = args.mode === 'keystrokes' ? 'keystrokes' : 'paste'
+    const reqMode: 'auto'|'paste'|'keystrokes' =
+      args.mode === 'keystrokes' ? 'keystrokes'
+        : args.mode === 'paste' ? 'paste'
+        : 'auto'
 
     const entry = registry.get(args.tab_id)
     if (!entry) {
@@ -285,8 +289,15 @@ export class McpServer {
       return this.toolErr('tab_not_ready', `tab ${args.tab_id} has no active session`)
     }
 
+    const supportsBP = (entry.tab.frontend as any)?.supportsBracketedPaste?.() ?? false
+    const useBrackets =
+      reqMode === 'paste' ? true
+        : reqMode === 'keystrokes' ? false
+        : supportsBP   // auto
+    const effectiveMode = useBrackets ? 'paste' : 'keystrokes'
+
     let payload = args.text
-    if (mode === 'paste') payload = `\x1b[200~${payload}\x1b[201~`
+    if (useBrackets) payload = `\x1b[200~${payload}\x1b[201~`
     if (submit) payload += '\r'
 
     const buf = Buffer.from(payload, 'utf8')
@@ -297,7 +308,7 @@ export class McpServer {
       return this.toolErr('send_failed', e?.message ?? String(e))
     }
 
-    this.log.info(`[#${reqId}] sent tab=${entry.id} mode=${mode} submit=${submit} bytes=${buf.length}`)
+    this.log.info(`[#${reqId}] sent tab=${entry.id} mode=${reqMode}→${effectiveMode} (bp=${supportsBP}) submit=${submit} bytes=${buf.length}`)
     const result = { ok: true, tab_id: entry.id, bytes_sent: buf.length }
     return { structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }] }
   }
