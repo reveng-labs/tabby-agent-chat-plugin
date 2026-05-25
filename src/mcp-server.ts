@@ -122,6 +122,16 @@ function isWslTab (tab: any): boolean {
   return /^wsl(\.exe)?$/.test(base)
 }
 
+// Walk up `.parent` to find the top-level tab in `app.tabs`. The Tabby UI's
+// rename ("Rename" right-click) sets customTitle on the top-level wrapper
+// (typically a SplitTabComponent), not on the inner terminal. To match what
+// the user sees in the tab bar, we must read title/customTitle from there.
+function topLevelTab (tab: any): any {
+  let t = tab
+  while (t?.parent) t = t.parent
+  return t
+}
+
 export interface StartOptions {
   registry: TabRegistry
   logSvc: LogService
@@ -500,8 +510,13 @@ export class McpServer {
         }
       }
 
-      const customTitle = ((e.tab as any).customTitle as string | undefined) ?? ''
-      const title = customTitle || (e.tab.title ?? '')
+      // Read displayed title from the top-level tab (where the UI's Rename
+      // sets customTitle). The inner terminal's customTitle/title only show
+      // the bash OSC title like "user@host: ~", which doesn't match what the
+      // user sees.
+      const top = topLevelTab(e.tab)
+      const customTitle = ((top as any).customTitle as string | undefined) ?? ''
+      const title = customTitle || (top.title ?? e.tab.title ?? '')
       return {
         id: e.id,
         title,                                                  // what the user sees in the tab header
@@ -583,14 +598,16 @@ export class McpServer {
     }
 
     // Uniqueness: another tab must not already have this customTitle.
-    const dupe = registry.list().find(e => e.id !== entry.id && (e.tab as any).customTitle === v.name)
+    // Compare against the top-level wrapper's customTitle (where the UI puts it).
+    const dupe = registry.list().find(e => e.id !== entry.id && (topLevelTab(e.tab) as any).customTitle === v.name)
     if (dupe) {
       return this.toolErr('name_in_use', `name "${v.name}" already used by tab ${dupe.id}`, { conflicting_tab_id: dupe.id })
     }
 
     try {
-      (entry.tab as any).setTitle?.(v.name)
-      ;(entry.tab as any).customTitle = v.name
+      const top = topLevelTab(entry.tab)
+      top.setTitle?.(v.name)
+      top.customTitle = v.name
       this.opts.app.emitTabsChanged()
     } catch (e: any) {
       this.log.error(`[#${reqId}] rename failed`, e)
@@ -653,21 +670,23 @@ export class McpServer {
 
     if (validatedName) {
       // Re-check uniqueness now, since other concurrent callers may have
-      // claimed the name between our up-front check and this point.
-      const dupe = registry.list().find(e => e.id !== newId && (e.tab as any).customTitle === validatedName)
+      // claimed the name between our up-front check and this point. Compare
+      // top-level customTitle (matches what Tabby's UI shows).
+      const dupe = registry.list().find(e => e.id !== newId && (topLevelTab(e.tab) as any).customTitle === validatedName)
       if (dupe) {
         // Close the tab we just opened so a name conflict doesn't leave
         // an orphan unnamed tab behind. app.closeTab needs the top-level
         // entry from app.tabs (often a SplitTabComponent wrapper), not the
         // inner terminal.
-        const topLevel = this.opts.app.tabs.find(t => t === entry.tab) ?? (entry.tab as any).parent ?? entry.tab
-        try { await this.opts.app.closeTab(topLevel as any, false) }
+        const top = topLevelTab(entry.tab)
+        try { await this.opts.app.closeTab(top, false) }
         catch (e: any) { this.log.warn(`[#${reqId}] new_tab: closeTab after conflict failed: ${e?.message}`) }
         return this.toolErr('name_in_use', `name "${validatedName}" already used by tab ${dupe.id}`, { conflicting_tab_id: dupe.id })
       }
       try {
-        (entry.tab as any).setTitle?.(validatedName)
-        ;(entry.tab as any).customTitle = validatedName
+        const top = topLevelTab(entry.tab)
+        top.setTitle?.(validatedName)
+        top.customTitle = validatedName
         this.opts.app.emitTabsChanged()
       } catch (e: any) {
         this.log.warn(`[#${reqId}] new_tab: rename after open failed: ${e?.message}`)
