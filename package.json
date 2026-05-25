@@ -10,5 +10,5 @@
     "build": "../tabby/node_modules/.bin/webpack --progress --color",
     "watch": "../tabby/node_modules/.bin/webpack --progress --color --watch"
   },
-  "files": ["dist"]
+  "files": ["dist", "INSTALL.md"]
 }
