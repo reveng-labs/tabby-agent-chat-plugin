@@ -144,9 +144,38 @@ export class McpServer {
     process.env.TABBY_AGENT_CHAT_URL = `http://127.0.0.1:${this.port}/mcp`
     process.env.TABBY_AGENT_CHAT_TOKEN = this.token
     process.env.TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS = INSTALL_FILE
-    this.log.info(`exported TABBY_AGENT_CHAT_URL, _TOKEN, _INSTALL_INSTRUCTIONS to renderer env`)
+    // Tell WSL to inherit our three vars. The INSTALL path gets the /p flag
+    // so wsl.exe translates "C:\\…\\INSTALL.md" to "/mnt/c/…/INSTALL.md".
+    // Other vars are plain strings (URL, opaque token). Preserve any
+    // pre-existing WSLENV entries the user or other tooling set.
+    this.addToWslenv([
+      'TABBY_AGENT_CHAT_URL',
+      'TABBY_AGENT_CHAT_TOKEN',
+      'TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS/p',
+    ])
+    this.log.info(`exported TABBY_AGENT_CHAT_URL, _TOKEN, _INSTALL_INSTRUCTIONS (incl. WSLENV propagation)`)
 
     this.installShutdownHooks()
+  }
+
+  private static readonly WSLENV_NAMES = new Set([
+    'TABBY_AGENT_CHAT_URL',
+    'TABBY_AGENT_CHAT_TOKEN',
+    'TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS',
+  ])
+
+  private addToWslenv (entries: string[]) {
+    const existing = (process.env.WSLENV ?? '').split(':').filter(s => s.length > 0)
+    // Drop any prior copies of our own names so we don't double-list on re-init.
+    const kept = existing.filter(e => !McpServer.WSLENV_NAMES.has(e.split('/')[0]))
+    process.env.WSLENV = [...kept, ...entries].join(':')
+  }
+
+  private removeFromWslenv () {
+    const existing = (process.env.WSLENV ?? '').split(':').filter(s => s.length > 0)
+    const kept = existing.filter(e => !McpServer.WSLENV_NAMES.has(e.split('/')[0]))
+    if (kept.length === 0) delete process.env.WSLENV
+    else process.env.WSLENV = kept.join(':')
   }
 
   private installShutdownHooks () {
@@ -161,6 +190,7 @@ export class McpServer {
     delete process.env.TABBY_AGENT_CHAT_URL
     delete process.env.TABBY_AGENT_CHAT_TOKEN
     delete process.env.TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS
+    this.removeFromWslenv()
     const srv = this.srv
     this.srv = undefined
     // Drop keep-alives first so close() can resolve even if a handler held a socket open.

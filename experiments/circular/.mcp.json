@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "tabby-agent-chat": {
+      "type": "http",
+      "url": "http://127.0.0.1:45551/mcp",
+      "headers": { "Authorization": "Bearer 4ed593d9-1ab1-4ca3-bbde-ac49d22135e8" }
+    }
+  }
+}
