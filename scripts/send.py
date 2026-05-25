@@ -5,15 +5,19 @@ Usage:
   send.py text TAB "echo hi"          # text + Enter (bracketed paste)
   send.py keys TAB $'\x03'             # raw keystrokes, no Enter
   send.py keys-sub TAB "ls"           # raw keystrokes + Enter
+
+Reads connection info from env vars set by the tabby-agent-chat plugin:
+  TABBY_AGENT_CHAT_URL
+  TABBY_AGENT_CHAT_TOKEN
 """
 import json, os, sys, urllib.request
 
-cfg = json.load(open(os.path.expanduser("~/.config/tabby/agent-chat.json")))
-PORT, TOKEN = cfg["port"], cfg["token"]
+URL = os.environ["TABBY_AGENT_CHAT_URL"]
+TOKEN = os.environ["TABBY_AGENT_CHAT_TOKEN"]
 
 mode_map = {
-    "text":     {"mode": "auto",       "submit": True},  # let plugin pick
-    "paste":    {"mode": "paste",      "submit": True},  # force wrap
+    "text":     {"mode": "auto",       "submit": True},
+    "paste":    {"mode": "paste",      "submit": True},
     "keys":     {"mode": "keystrokes", "submit": False},
     "keys-sub": {"mode": "keystrokes", "submit": True},
 }
@@ -25,7 +29,7 @@ body = json.dumps({
     "params": {"name": "send_to_tab", "arguments": {"tab_id": tab, "text": payload, **mode_map[cmd]}},
 }).encode()
 req = urllib.request.Request(
-    f"http://127.0.0.1:{PORT}/mcp",
+    URL,
     data=body,
     headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
 )

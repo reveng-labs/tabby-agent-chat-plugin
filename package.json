@@ -6,9 +6,22 @@
   "author": "tabby-agent-chat contributors",
   "license": "MIT",
   "main": "dist/index.js",
+  "typings": "dist/index.d.ts",
   "scripts": {
-    "build": "../tabby/node_modules/.bin/webpack --progress --color",
-    "watch": "../tabby/node_modules/.bin/webpack --progress --color --watch"
+    "build": "webpack --progress --color",
+    "watch": "webpack --progress --color --watch",
+    "prepublishOnly": "npm run build"
   },
-  "files": ["dist", "INSTALL.md"]
+  "files": ["dist", "INSTALL.md"],
+  "devDependencies": {
+    "@angular/core": "^15.2.6",
+    "@types/node": "^18.0.0",
+    "rxjs": "^7.5.0",
+    "tabby-core": "1.0.231-nightly.0",
+    "tabby-terminal": "1.0.231-nightly.0",
+    "ts-loader": "^9.4.0",
+    "typescript": "^4.9.0",
+    "webpack": "^5.0.0",
+    "webpack-cli": "^5.0.0"
+  }
 }
