@@ -8,7 +8,7 @@ import { McpServer } from './mcp-server'
 @NgModule({
   providers: [TabRegistry, McpServer],
 })
-export default class InputBrokerModule {
+export default class AgentChatModule {
   constructor (
     app: AppService,
     logSvc: LogService,
@@ -17,7 +17,7 @@ export default class InputBrokerModule {
   ) {
     registry.init(app, logSvc)
     server.start(registry, logSvc).catch(err => {
-      logSvc.create('input-broker').error('failed to start MCP server', err)
+      logSvc.create('agent-chat').error('failed to start MCP server', err)
     })
   }
 }

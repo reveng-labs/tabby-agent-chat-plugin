@@ -6,7 +6,7 @@ const __dirname = url.fileURLToPath(new URL('.', import.meta.url))
 const TABBY_ROOT = path.resolve(__dirname, '..', 'tabby')
 
 export default () => {
-  const cfg = baseConfig({ name: 'input-broker', dirname: __dirname })
+  const cfg = baseConfig({ name: 'agent-chat', dirname: __dirname })
 
   // Re-point module resolution at Tabby's installed deps so we don't
   // have to duplicate the full Angular toolchain in our own node_modules.

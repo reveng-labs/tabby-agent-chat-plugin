@@ -1,9 +1,9 @@
 {
-  "name": "tabby-input-broker",
+  "name": "tabby-agent-chat",
   "version": "0.1.0",
-  "description": "Exposes Tabby tabs over MCP so an AI agent in one tab can send input to another",
+  "description": "Agent Chat for Tabby — exposes terminal tabs over MCP so an AI agent in one tab can send input to another",
   "keywords": ["tabby-plugin"],
-  "author": "tabby-input-broker contributors",
+  "author": "tabby-agent-chat contributors",
   "license": "MIT",
   "main": "dist/index.js",
   "scripts": {

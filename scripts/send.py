@@ -8,7 +8,7 @@ Usage:
 """
 import json, os, sys, urllib.request
 
-cfg = json.load(open(os.path.expanduser("~/.config/tabby/input-broker.json")))
+cfg = json.load(open(os.path.expanduser("~/.config/tabby/agent-chat.json")))
 PORT, TOKEN = cfg["port"], cfg["token"]
 
 mode_map = {

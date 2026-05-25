@@ -25,7 +25,7 @@ export class TabRegistry {
   private log!: Logger
 
   init (app: AppService, logSvc: LogService) {
-    this.log = logSvc.create('input-broker:registry')
+    this.log = logSvc.create('agent-chat:registry')
     for (const t of app.tabs) this.safeWalk(t)
     // Wrap callbacks: an unhandled throw kills the Subject's subscription.
     this.appSubs.add(app.tabOpened$.subscribe(t => this.safeWalk(t)))

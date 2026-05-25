@@ -11,7 +11,7 @@ import { TabRegistry } from './tab-registry'
 const MAX_BODY_BYTES = 1024 * 1024              // 1 MB hard cap
 const MAX_TEXT_BYTES = 64 * 1024                // per send_to_tab payload
 const CHILD_PROC_TIMEOUT_MS = 1000              // bound list_tabs latency
-const DISCOVERY_FILE = path.join(homedir(), '.config', 'tabby', 'input-broker.json')
+const DISCOVERY_FILE = path.join(homedir(), '.config', 'tabby', 'agent-chat.json')
 
 interface RawProc { pid: number; ppid: number; command: string; cmdline?: string }
 
@@ -63,7 +63,7 @@ export class McpServer {
   }
 
   private async _start (registry: TabRegistry, logSvc: LogService) {
-    this.log = logSvc.create('input-broker')
+    this.log = logSvc.create('agent-chat')
 
     const srv = createServer((req, res) => {
       this.safeHandle(req, res, registry).catch(err => {
@@ -276,7 +276,7 @@ export class McpServer {
     if (msg.method === 'initialize') {
       return reply({
         protocolVersion: '2025-06-18',
-        serverInfo: { name: 'tabby-input-broker', version: '0.1.0' },
+        serverInfo: { name: 'tabby-agent-chat', version: '0.1.0' },
         capabilities: { tools: {} },
       })
     }
