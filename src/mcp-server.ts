@@ -722,16 +722,6 @@ export class McpServer {
 
   // ---------------------------------------------------------------- utils
 
-  // NB: on timeout the underlying promise is abandoned, not cancelled — the
-  // platform getChildProcesses() implementations have no AbortSignal support.
-  // Late rejection lands on the already-settled deferred (harmless).
-  private withTimeout<T> (p: Promise<T>, ms: number): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)
-      p.then(v => { clearTimeout(timer); resolve(v) }, e => { clearTimeout(timer); reject(e) })
-    })
-  }
-
   // Tabby's PTYProxy exposes both getPID (the wrapper) and getTruePID (the
   // actual shell). UAC-elevated sessions wrap the shell in a helper; trueid
   // skips the helper. Returns null if the session is gone.
