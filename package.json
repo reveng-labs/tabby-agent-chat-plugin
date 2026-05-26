@@ -7,6 +7,10 @@
   ],
   "author": "tabby-agent-chat contributors",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/reveng-labs/tabby-agent-chat-plugin.git"
+  },
   "main": "dist/index.js",
   "typings": "dist/index.d.ts",
   "scripts": {
