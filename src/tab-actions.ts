@@ -1,8 +1,8 @@
-import { spawn } from 'child_process'
 import { NgZone } from '@angular/core'
 import { AppService, ProfilesService, Logger } from 'tabby-core'
 import { TabRegistry } from './tab-registry'
 import { enumerateLocalTree, RawProc } from './process-tree'
+import { isWslTab, queryWslProcessesByTabId, WSL_QUERY_TIMEOUT_MS } from './wsl-procs'
 
 export const MAX_TEXT_BYTES = 64 * 1024
 export const PROC_TREE_TIMEOUT_MS = 2000
@@ -11,64 +11,6 @@ export const MAX_TABS = 64
 export const NEW_TAB_WAIT_MS = 15000
 export const SESSION_READY_WAIT_MS = 15000
 export const PROMPT_READY_WAIT_MS = 10000
-export const WSL_QUERY_TIMEOUT_MS = 2000
-
-// Run inside WSL via `wsl.exe -- sh -c <SCRIPT> _ <TAB_ID>`. Locates the bash
-// whose /proc/<pid>/environ contains the marker, walks its descendants, emits
-// "pid<TAB>ppid<TAB>cmdline" lines for each.
-const WSL_QUERY_SCRIPT = `T="$1"
-root=$(grep -al "TABBY_AGENT_CHAT_TAB_ID=$T" /proc/*/environ 2>/dev/null | head -1 | cut -d/ -f3)
-[ -z "$root" ] && exit 0
-front="$root"; all="$root"
-while [ -n "$front" ]; do
-  nxt=""
-  for p in $front; do
-    for c in $(pgrep -P "$p" 2>/dev/null); do all="$all $c"; nxt="$nxt $c"; done
-  done
-  front="$nxt"
-done
-for pid in $all; do
-  if [ -e /proc/$pid/cmdline ]; then
-    cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
-    ppid=$(awk '/^PPid:/ {print $2}' /proc/$pid/status 2>/dev/null)
-    printf '%s\\t%s\\t%s\\n' "$pid" "$ppid" "$cmd"
-  fi
-done`
-
-function queryWslProcessesByTabId (tabId: string, timeoutMs: number): Promise<RawProc[]> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('wsl.exe', ['--', 'sh', '-c', WSL_QUERY_SCRIPT, '_', tabId], { windowsHide: true })
-    let stdout = ''
-    let settled = false
-    const timer = setTimeout(() => {
-      if (settled) return
-      settled = true
-      try { child.kill() } catch { /* gone */ }
-      reject(new Error(`wsl.exe query timed out after ${timeoutMs}ms`))
-    }, timeoutMs)
-    timer.unref?.()
-    child.stdout?.on('data', d => { stdout += d.toString() })
-    child.on('error', err => { if (!settled) { settled = true; clearTimeout(timer); reject(err) } })
-    child.on('close', () => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      const procs: RawProc[] = []
-      for (const line of stdout.split('\n')) {
-        if (!line.trim()) continue
-        const parts = line.split('\t')
-        if (parts.length < 3) continue
-        const pid = parseInt(parts[0], 10)
-        const ppid = parseInt(parts[1], 10)
-        const cmdline = parts[2].trim()
-        if (!Number.isFinite(pid)) continue
-        const argv0 = (cmdline.split(' ')[0] || '').split('/').pop() || ''
-        procs.push({ pid, ppid, command: argv0, cmdline })
-      }
-      resolve(procs)
-    })
-  })
-}
 
 export function validateTabName (name: unknown): { ok: true, name: string } | { ok: false, code: string, error: string } {
   if (typeof name !== 'string') return { ok: false, code: 'invalid_args', error: 'name must be a string' }
@@ -77,13 +19,6 @@ export function validateTabName (name: unknown): { ok: true, name: string } | { 
   // eslint-disable-next-line no-control-regex
   if (/[\x00-\x1f\x7f-\x9f]/.test(name)) return { ok: false, code: 'invalid_args', error: 'name contains control characters' }
   return { ok: true, name }
-}
-
-export function isWslTab (tab: any): boolean {
-  if (process.platform !== 'win32') return false
-  const cmd: string = tab?.profile?.options?.command ?? ''
-  const base = (cmd.split(/[\\/]/).pop() || '').toLowerCase()
-  return /^wsl(\.exe)?$/.test(base)
 }
 
 // Walk up `.parent` to the top-level tab in `app.tabs`. The UI's rename sets
@@ -123,14 +58,13 @@ export interface ProcessesResult {
   error?: string
 }
 
+// Host-side process walk from the tab's true PID. For a WSL tab this returns
+// the Windows-side wsl.exe tree, not the processes running inside the distro —
+// callers that have a tab id should use listTabProcessesFull, which queries
+// inside the distro first and falls back here.
 export async function listTabProcesses (tab: any): Promise<ProcessesResult> {
   let processes: RawProc[] = []
   let error: string | undefined
-  if (isWslTab(tab)) {
-    // We can't recover the per-tab id from the tab object directly here —
-    // callers in the WSL path pass it separately. Skip WSL handling here and
-    // let callers compose. Most callers don't run on Windows anyway.
-  }
   const truePID = await tabTruePID(tab)
   if (truePID != null) {
     try {
@@ -160,6 +94,23 @@ export async function listTabProcessesFull (tab: any, tabId: string): Promise<Pr
 export interface ToolError { ok: false, code: string, error: string, [k: string]: any }
 export function toolError (code: string, error: string, extra: Record<string, any> = {}): ToolError {
   return { ok: false, code, error, ...extra }
+}
+
+export interface ListedTab {
+  id: string
+  name: string | null
+  processes: RawProc[]
+  processes_error?: string
+}
+
+export async function listTabsLocal (registry: TabRegistry): Promise<{ tabs: ListedTab[] }> {
+  const tabs = await Promise.all(registry.list().map(async e => {
+    const procRes = await listTabProcessesFull(e.tab, e.id)
+    const out: ListedTab = { id: e.id, name: getTabName(e.tab), processes: procRes.processes }
+    if (procRes.error) out.processes_error = procRes.error
+    return out
+  }))
+  return { tabs }
 }
 
 export interface SendOk { ok: true, tab_id: string, bytes_sent: number, mode: 'paste'|'keystrokes' }
@@ -208,14 +159,9 @@ export async function sendToTabLocal (
   // Session attached ≠ shell ready for input. The shell typically issues
   // DECSET 2004 (bracketed paste) right around the time it prints its first
   // prompt; before that, bytes written to the pty get swallowed or land in a
-  // pre-prompt buffer that gets cleared. Wait for that signal (best-effort:
-  // bounded so exotic shells without BP still proceed).
-  await waitForPromptReady(entry.tab, PROMPT_READY_WAIT_MS, log, reqId)
-
-  const fe: any = entry.tab.frontend
-  const supportsBP = typeof fe?.supportsBracketedPaste === 'function'
-    ? !!fe.supportsBracketedPaste()
-    : false
+  // pre-prompt buffer that gets cleared. Wait for that signal (bounded so
+  // exotic shells without BP still proceed via keystrokes).
+  const supportsBP = await waitForBracketedPaste(entry.tab, PROMPT_READY_WAIT_MS, log, reqId)
   const useBrackets =
     reqMode === 'paste' ? true
       : reqMode === 'keystrokes' ? false
@@ -244,7 +190,7 @@ export function renameTabLocal (
   registry: TabRegistry,
   app: AppService,
   args: { tab_id: string, name: string },
-  knownNames: Set<string>, // names known across all windows (excluding the renamed tab itself)
+  knownNames: Set<string>, // other tabs' custom names in this window (the renamed tab itself excluded)
   log?: Logger,
   reqId?: number,
 ): RenameOk | ToolError {
@@ -281,12 +227,12 @@ export async function newTabLocal (
   profiles: ProfilesService,
   args: { name?: string },
   knownNames: Set<string>,
-  totalTabsAcrossWindows: number,
+  tabCount: number,
   log?: Logger,
   reqId?: number,
 ): Promise<NewOk | ToolError> {
-  if (totalTabsAcrossWindows >= MAX_TABS) {
-    return toolError('too_many_tabs', `tab cap reached (${totalTabsAcrossWindows}/${MAX_TABS}); refusing to open new tab`)
+  if (tabCount >= MAX_TABS) {
+    return toolError('too_many_tabs', `tab cap reached (${tabCount}/${MAX_TABS}); refusing to open new tab`)
   }
   let validatedName: string | undefined
   if (args?.name !== undefined) {
@@ -360,30 +306,33 @@ async function waitForWrapperRegistered (registry: TabRegistry, wrapper: any, ti
 }
 
 // Poll the frontend's bracketed-paste capability — proxy for "shell printed
-// its first prompt and is now consuming input." Bounded wait so a shell that
-// never enables BP (rare; cmd.exe, dumb terminals) still proceeds and falls
-// through to the keystrokes path.
-async function waitForPromptReady (tab: any, timeoutMs: number, log?: Logger, reqId?: number): Promise<void> {
+// its first prompt and is now consuming input." Returns whether BP is active
+// (and therefore whether the caller should wrap payloads). Bounded wait so a
+// shell that never enables BP (cmd.exe, dumb terminals) still proceeds and
+// the caller falls through to the keystrokes path.
+async function waitForBracketedPaste (tab: any, timeoutMs: number, log?: Logger, reqId?: number): Promise<boolean> {
   const fe: any = tab?.frontend
-  if (typeof fe?.supportsBracketedPaste !== 'function') return
-  if (fe.supportsBracketedPaste()) return
+  if (typeof fe?.supportsBracketedPaste !== 'function') return false
   const t0 = Date.now()
   const deadline = t0 + timeoutMs
-  while (Date.now() < deadline) {
-    if (fe.supportsBracketedPaste()) {
-      log?.info(`[#${reqId}] prompt ready after ${Date.now() - t0}ms`)
-      return
+  while (!fe.supportsBracketedPaste()) {
+    if (Date.now() >= deadline) {
+      log?.warn(`[#${reqId}] BP wait timeout after ${timeoutMs}ms — sending as keystrokes`)
+      return false
     }
     await new Promise(r => setTimeout(r, 100))
   }
-  log?.warn(`[#${reqId}] prompt ready timeout after ${timeoutMs}ms — sending as keystrokes`)
+  const waited = Date.now() - t0
+  if (waited >= 100) log?.info(`[#${reqId}] BP ready after ${waited}ms`)
+  return true
 }
 
-// Wait for the tab's session to attach. Resolves on sessionChanged$ emit;
-// periodically calls app.selectTab(wrapper) inside NgZone to kick Angular's
-// change detection — the lazy frontend.attach chain depends on splitTab's
-// ngAfterViewInit, which only runs once CD renders the wrapper. When our
-// socket callback fires outside the zone, CD doesn't see it, so we re-enter.
+// Wait for the tab's session to attach. Arms a sessionChanged$ subscription
+// and a periodic kicker (app.selectTab inside NgZone, to nudge Angular CD —
+// the lazy frontend.attach chain runs only when SplitTab's ngAfterViewInit
+// fires, which needs CD, which doesn't fire for events delivered outside the
+// zone like our socket data callbacks). Then a single sync check covers the
+// case where the session was already attached before we got here.
 async function waitForSessionViaFocusKick (
   tab: any,
   app: AppService,
@@ -392,7 +341,6 @@ async function waitForSessionViaFocusKick (
   log?: Logger,
   reqId?: number,
 ): Promise<boolean> {
-  if (tab?.session) return true
   const wrapper = topLevelTab(tab)
   return new Promise(resolve => {
     let settled = false
@@ -404,22 +352,16 @@ async function waitForSessionViaFocusKick (
       try { sub?.unsubscribe?.() } catch { /* gone */ }
       clearInterval(kicker)
       clearTimeout(timer)
-      log?.info(`[#${reqId}] waitForSession finished ok=${ok} via=${via} kicks=${kicks} elapsedMs=${Date.now() - t0} hasFocus=${tab?.hasFocus} frontend=${!!tab?.frontend}`)
+      log?.info(`[#${reqId}] waitForSession ok=${ok} via=${via} kicks=${kicks} elapsedMs=${Date.now() - t0}`)
       resolve(ok)
     }
-    const stream: any = tab?.sessionChanged$
-    const sub = stream?.subscribe?.((s: any) => { if (s) finish(true, 'sessionChanged$') })
+    const sub = tab?.sessionChanged$?.subscribe?.((s: any) => { if (s) finish(true, 'sessionChanged$') })
     const kicker = setInterval(() => {
-      if (tab?.session) { finish(true, 'kicker-poll'); return }
+      if (tab?.session) return finish(true, 'kicker')
       kicks++
-      zone.run(() => {
-        try { app.selectTab(wrapper) } catch { /* wrapper gone */ }
-      })
-      if (kicks <= 3 || kicks % 10 === 0) {
-        log?.info(`[#${reqId}] kick #${kicks} hasFocus=${tab?.hasFocus} frontend=${!!tab?.frontend} content=${!!(tab as any)?.content}`)
-      }
+      zone.run(() => { try { app.selectTab(wrapper) } catch { /* wrapper gone */ } })
     }, 200)
     const timer = setTimeout(() => finish(false, 'timeout'), timeoutMs)
-    if (tab?.session) finish(true, 'pre-promise-race')
+    if (tab?.session) finish(true, 'sync')
   })
 }

@@ -20,9 +20,9 @@ export function pipeLines (sock: Socket, onLine: (line: string) => void): void {
 }
 
 export function writeJson (sock: Socket, obj: any): boolean {
-  try {
-    return sock.write(JSON.stringify(obj) + '\n')
-  } catch {
-    return false
-  }
+  // JSON.stringify errors here are programmer errors (cycle, BigInt) — let
+  // them propagate to the dispatcher's try/catch. Only catch the socket write,
+  // which can legitimately fail mid-flight (EPIPE etc.).
+  const line = JSON.stringify(obj) + '\n'
+  try { return sock.write(line) } catch { return false }
 }

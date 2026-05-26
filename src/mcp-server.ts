@@ -7,8 +7,8 @@ import { getOrAllocateSocketPath } from './socket-path'
 import { pipeLines, writeJson } from './wire'
 import {
   MAX_TABS, MAX_TEXT_BYTES, MAX_TAB_NAME_LEN,
-  listTabProcessesFull, getTabName,
-  sendToTabLocal, renameTabLocal, newTabLocal,
+  getTabName,
+  listTabsLocal, sendToTabLocal, renameTabLocal, newTabLocal,
   toolError,
 } from './tab-actions'
 import pkg from '../package.json'
@@ -49,16 +49,9 @@ export class McpServer {
   private log!: Logger
   private opts!: McpServerStartOptions
   private reqSeq = 0
-  private starting?: Promise<void>
 
   async start (opts: McpServerStartOptions): Promise<void> {
-    if (this.srv) return
-    if (this.starting) return this.starting
-    this.starting = this._start(opts)
-    try { await this.starting } finally { this.starting = undefined }
-  }
-
-  private async _start (opts: McpServerStartOptions) {
+    if (this.srv) throw new Error('McpServer.start: already started')
     this.opts = opts
     this.log = opts.logSvc.create('agent-chat:server')
 
@@ -83,13 +76,6 @@ export class McpServer {
 
     this.srv = srv
     this.log.info(`listening on ${sockPath} (window=${opts.windowId})`)
-    this.installShutdownHooks()
-  }
-
-  private installShutdownHooks () {
-    if (typeof window !== 'undefined') {
-      window.addEventListener('beforeunload', () => { void this.stop() })
-    }
   }
 
   async stop () {
@@ -144,21 +130,31 @@ export class McpServer {
     if (msg.method === 'tools/call') {
       const name: string = msg.params?.name
       const args = msg.params?.arguments ?? {}
+      const { registry, app, zone, profiles } = this.opts
       try {
-        if (name === 'list_tabs') return reply(await this.toolListTabs(reqId))
-        if (name === 'send_to_tab') return reply(await this.toolSend(args, reqId))
-        if (name === 'rename_tab') return reply(await this.toolRename(args, reqId))
-        if (name === 'new_tab')    return reply(await this.toolNew(args, reqId))
-        return err(-32601, `unknown tool: ${name}`)
+        let result: any
+        if (name === 'list_tabs')        result = await listTabsLocal(registry)
+        else if (name === 'send_to_tab') result = await sendToTabLocal(registry, app, zone, args, this.log, reqId)
+        else if (name === 'rename_tab')  result = renameTabLocal(registry, app, args, this.localTabNames(args?.tab_id), this.log, reqId)
+        else if (name === 'new_tab')     result = await newTabLocal(registry, app, profiles, args ?? {}, this.localTabNames(), registry.list().length, this.log, reqId)
+        else return err(-32601, `unknown tool: ${name}`)
+        return reply(this.wrap(result))
       } catch (e: any) {
         this.log.error(`[#${reqId}] tool ${name} threw`, e)
-        return reply({
-          content: [{ type: 'text', text: JSON.stringify({ ok: false, code: 'internal', error: e?.message ?? String(e) }) }],
-          isError: true,
-        })
+        return reply(this.wrap(toolError('internal', e?.message ?? String(e))))
       }
     }
     return err(-32601, `unknown method: ${msg.method}`)
+  }
+
+  private localTabNames (excludeTabId?: string): Set<string> {
+    const names = new Set<string>()
+    for (const e of this.opts.registry.list()) {
+      if (e.id === excludeTabId) continue
+      const n = getTabName(e.tab)
+      if (n) names.add(n)
+    }
+    return names
   }
 
   private toolList () {
@@ -212,67 +208,9 @@ export class McpServer {
     ]
   }
 
-  // ---------------------------------------------------------------- tools
-
-  private async toolListTabs (reqId: number) {
-    const tabs = await Promise.all(this.opts.registry.list().map(async e => {
-      const procRes = await listTabProcessesFull(e.tab, e.id)
-      return {
-        id: e.id,
-        name: getTabName(e.tab),
-        processes: procRes.processes,
-        ...(procRes.error ? { processes_error: procRes.error } : {}),
-      }
-    }))
-    this.log.debug(`[#${reqId}] list_tabs returned ${tabs.length} tab(s)`)
-    const result = { tabs }
-    return { structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }] }
-  }
-
-  private async toolSend (args: any, reqId: number) {
-    const tabId = args?.tab_id
-    if (typeof tabId !== 'string' || !tabId) {
-      return this.wrap(toolError('invalid_args', 'tab_id (string) is required'))
-    }
-    if (!this.opts.registry.get(tabId)) {
-      return this.wrap(toolError('unknown_tab', `no tab with id ${tabId}`, { available_ids: this.opts.registry.list().map(e => e.id) }))
-    }
-    const res = await sendToTabLocal(this.opts.registry, this.opts.app, this.opts.zone, args, this.log, reqId)
-    return this.wrap(res)
-  }
-
-  private async toolRename (args: any, reqId: number) {
-    const tabId = args?.tab_id
-    if (typeof tabId !== 'string' || !tabId) {
-      return this.wrap(toolError('invalid_args', 'tab_id (string) is required'))
-    }
-    if (!this.opts.registry.get(tabId)) {
-      return this.wrap(toolError('unknown_tab', `no tab with id ${tabId}`, { available_ids: this.opts.registry.list().map(e => e.id) }))
-    }
-    const known = this.localTabNames(tabId)
-    const res = renameTabLocal(this.opts.registry, this.opts.app, args, known, this.log, reqId)
-    return this.wrap(res)
-  }
-
-  private async toolNew (args: any, reqId: number) {
-    const known = this.localTabNames()
-    const count = this.opts.registry.list().length
-    const res = await newTabLocal(this.opts.registry, this.opts.app, this.opts.profiles, args ?? {}, known, count, this.log, reqId)
-    return this.wrap(res)
-  }
-
-  private localTabNames (excludeTabId?: string): Set<string> {
-    const names = new Set<string>()
-    for (const e of this.opts.registry.list()) {
-      if (e.id === excludeTabId) continue
-      const n = getTabName(e.tab)
-      if (n) names.add(n)
-    }
-    return names
-  }
-
-  // Wrap a tool result so MCP shapes are consistent: structuredContent +
-  // content-text. Errors become { isError: true } per MCP convention.
+  // Wrap a tool result so MCP envelope shapes are consistent: success becomes
+  // structuredContent + content-text; failure (ok: false) becomes content-text
+  // with isError: true, per MCP convention.
   private wrap (res: any) {
     if (res && res.ok === false) {
       return { content: [{ type: 'text', text: JSON.stringify(res) }], isError: true }
