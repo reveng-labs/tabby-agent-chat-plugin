@@ -38,15 +38,12 @@ jobs:
       - run: npm ci
       - run: npm run build
 
-      # First publish uses NPM_TOKEN because npm requires a package to
-      # exist before Trusted Publishing can be configured for it. After
-      # the first publish, configure TP on npmjs.com/package/<name>/access
-      # and switch this step to `npm publish --access public --provenance`
-      # (drop NODE_AUTH_TOKEN); the OIDC handshake will use id-token.
+      # Publish via npm Trusted Publishing — the id-token: write permission
+      # at the job level lets npm verify the OIDC claim from this workflow
+      # against the trusted publisher configured on the package's npm page.
+      # No NPM_TOKEN needed.
       - name: Publish to npm
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
