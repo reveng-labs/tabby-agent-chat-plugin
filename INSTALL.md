@@ -1,70 +1,70 @@
 # tabby-agent-chat — install and usage
 
 This file ships with the Tabby plugin `tabby-agent-chat`. While the plugin
-is running, its path is exported as `TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS`
+is running its path is exported as `TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS`
 so any AI agent running in a Tabby tab can locate it.
 
 ## What is this
 
 An MCP (Model Context Protocol) server that lets one AI agent (Claude
 Code, Codex, etc.) send messages to other AI agents running in other
-terminal tabs of the same Tabby window. Useful for orchestrating
+terminal tabs of the same Tabby process. Useful for orchestrating
 multi-agent workflows.
 
-The server is HTTP, bound to 127.0.0.1 only, auth via a per-window
-bearer token. Connection info is in these env vars (present in any
-shell spawned inside Tabby after the plugin loads):
+The MCP transport is **stdio**. The agent spawns a small shim binary
+(`shim.js`) which proxies JSON-RPC to a Unix socket owned by the Tabby
+plugin (on Windows the same shim uses a named pipe). No ports, no
+tokens, nothing to re-register when Tabby restarts.
 
-    TABBY_AGENT_CHAT_URL    full http://127.0.0.1:PORT/mcp URL
-    TABBY_AGENT_CHAT_TOKEN  bearer token
+Connection info is in these env vars (present in any shell spawned
+inside Tabby after the plugin loads):
+
+    TABBY_AGENT_CHAT_SHIM    absolute path to shim.js — the MCP command
+    TABBY_AGENT_CHAT_SOCKET  the UDS / pipe path the shim connects to
+    TABBY_AGENT_CHAT_TAB_ID  this tab's id (per-tab, set automatically)
 
 ## Installation
 
-Run the command for whichever agent CLI you're using. Both commands use
-`${VAR}` so the connection info is resolved by the agent itself at
-connect time — not baked into the config file. This means the same
-config keeps working across Tabby restarts (the port and token change
-each run).
+Pick the command for whichever agent CLI you're using. The shim is a
+plain node script; both commands register `node $TABBY_AGENT_CHAT_SHIM`
+as a stdio MCP server.
 
 ### Claude Code
 
 ```
-claude mcp add --transport http --scope user tabby-agent-chat \
-  '${TABBY_AGENT_CHAT_URL}' \
-  --header 'Authorization: Bearer ${TABBY_AGENT_CHAT_TOKEN}'
+claude mcp add --transport stdio --scope user tabby-agent-chat \
+  node "$TABBY_AGENT_CHAT_SHIM"
 ```
 
 ### Codex
 
 ```
-codex mcp add tabby-agent-chat \
-  --url "$TABBY_AGENT_CHAT_URL" \
-  --bearer-token-env-var TABBY_AGENT_CHAT_TOKEN
+codex mcp add tabby-agent-chat node "$TABBY_AGENT_CHAT_SHIM"
 ```
 
-NOTE: Codex stores `--url` as a literal value; on Tabby restart the URL
-goes stale (new port). Re-run the command after each Tabby restart, or
-edit `~/.codex/config.toml` to use a stable port if you want a one-time
-setup. Token rotation is handled because `--bearer-token-env-var` is read
-at runtime.
+Once registered, the same config keeps working across Tabby restarts —
+the socket path is stable (`$XDG_RUNTIME_DIR/tabby-agent-chat.sock` on
+Linux, `/tmp/tabby-agent-chat-<uid>.sock` on macOS, named pipe on
+Windows) and the shim discovers it the same way the plugin does.
 
 ## Tools exposed by this MCP server
 
-* `list_tabs` — returns every terminal tab in the current Tabby window.
-  Each entry has:
+* `list_tabs` — returns every terminal tab across **all** windows of the
+  current Tabby process. Each entry has:
     - `id`        stable string id for the tab — always present, use
                   with `send_to_tab` and `rename_tab`
     - `name`      the explicitly-set custom name (via Tabby's Rename
                   right-click or `rename_tab`), or `null` if no custom
                   name was set. The shell's dynamic OSC title is *not*
                   used as a fallback because it's noisy.
+    - `window`    numeric window id (0 = main window; others = secondary)
     - `processes` `[{pid, ppid, command, cmdline?}]` — the full process
                   tree running in the tab. `cmdline` reveals which
                   agent is running (e.g. `node …/codex`, `claude`)
 
 * `send_to_tab(tab_id, text, [submit=true], [mode="auto"])` — inject text
   into the target tab's stdin. The receiving program cannot distinguish
-  this from typed/pasted input.
+  this from typed/pasted input. Works across windows.
     - `mode="auto"`      (default) reads xterm.js's bracketed-paste flag
                          and wraps only when the target supports it
     - `mode="paste"`     forces bracketed-paste wrapping
@@ -73,16 +73,14 @@ at runtime.
     - `submit=true` (default) appends `\r` so the line is "entered"
 
 * `rename_tab(tab_id, name)` — set a tab's custom name. Names must be
-  unique among addressable tabs, 1–64 chars, no control characters.
-  Returns `{ok, tab_id, name}` or one of the error codes:
-  `invalid_args`, `unknown_tab`, `name_in_use`, `internal`.
+  unique across **all** addressable tabs (every window), 1–64 chars,
+  no control characters. Returns `{ok, tab_id, name}` or one of:
+  `invalid_args`, `unknown_tab`, `name_in_use`, `internal`, `rpc_failed`.
 
-* `new_tab([name])` — open a new local terminal tab in this window.
-  Refuses to create more than 64 addressable tabs (fork-bomb guard).
-  Optionally sets a custom name in the same call. Returns
-  `{ok, tab_id, name?}` once the new tab has a stable id, or one of:
-  `too_many_tabs`, `name_in_use`, `no_local_profile`, `open_failed`,
-  `register_timeout`, `internal`.
+* `new_tab([name])` — open a new local terminal tab in the **main**
+  Tabby window. Refuses to create more than 64 addressable tabs
+  (fork-bomb guard, counted across all windows). Optionally sets a
+  custom name in the same call.
 
 ## Typical use case
 
@@ -96,11 +94,30 @@ User asks one agent: "send X to the agent doing Y".
      - Codex:       `~/.codex/sessions/<id>/...`
 3. Agent calls `send_to_tab(tab_id, "X")` to deliver the message.
 
+## Architecture notes
+
+* **Leader/follower across windows.** Each Tabby process has one main
+  window (the leader) which owns the UDS. Secondary windows act as
+  followers and tunnel their tabs through the leader. The MCP client
+  (your agent's shim) only ever talks to the leader — cross-window
+  routing is invisible.
+
+* **Closing the main window.** If you close the main window while
+  secondary windows stay open, the leader is gone and the MCP goes
+  down until next launch. Tabby normally closes all windows when
+  the main one is closed.
+
+* **Multiple Tabby processes.** If you run two separate Tabby
+  installations at once, only one wins the socket bind. The other
+  logs the conflict and its tabs aren't reachable via MCP. Most
+  setups run a single Tabby; this only affects unusual deployments.
+
 ## Limitations
 
 - Only local terminal tabs are addressable. SSH / serial / telnet tabs
   do not expose a tab id and won't appear in `list_tabs`.
-- Each Tabby window runs its own MCP server. Cross-window messaging is
-  not supported.
 - Shells opened before the plugin loaded won't have the env vars; close
   and reopen the tab to fix.
+- WSL agents (Linux agent inside a Windows host's WSL distro) cannot
+  reach the Windows-side socket. Use Tabby's native Windows terminal
+  for agents that need to drive MCP.

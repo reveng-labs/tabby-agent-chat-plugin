@@ -5,13 +5,16 @@ const __dirname = url.fileURLToPath(new URL('.', import.meta.url))
 
 export default {
   target: 'node',
-  entry: './src/index.ts',
+  entry: {
+    index: './src/index.ts',
+    shim: './src/shim.ts',
+  },
   devtool: 'source-map',
   context: __dirname,
   mode: 'development',
   output: {
     path: path.resolve(__dirname, 'dist'),
-    filename: 'index.js',
+    filename: '[name].js',
     pathinfo: true,
     libraryTarget: 'umd',
     devtoolModuleFilenameTemplate: 'webpack-tabby-agent-chat:///[resource-path]',

@@ -1,96 +1,26 @@
-import { Injectable } from '@angular/core'
-import { AddressInfo } from 'net'
-import { createServer, IncomingMessage, Server, ServerResponse } from 'http'
+import { Injectable, NgZone } from '@angular/core'
+import { Server, Socket, createServer } from 'net'
 import { randomUUID } from 'crypto'
-import { spawn } from 'child_process'
-import * as path from 'path'
+import { promises as fs } from 'fs'
 import { AppService, LogService, Logger, ProfilesService } from 'tabby-core'
 import { TabRegistry, TAB_ID_ENV_KEY } from './tab-registry'
-import { enumerateLocalTree, RawProc } from './process-tree'
+import { RawProc } from './process-tree'
+import { getSocketPath } from './socket-path'
+import {
+  pipeLines, writeJson,
+  FollowerEvent, FollowerTabInfo,
+  LeaderRpcRequest, LeaderRpcResponse,
+  isFollowerEvent, isLeaderRpcResponse,
+} from './wire'
+import {
+  MAX_TABS, MAX_TEXT_BYTES, MAX_TAB_NAME_LEN,
+  listTabProcessesFull, getTabName, isWslTab,
+  sendToTabLocal, renameTabLocal, newTabLocal,
+  toolError, ToolError,
+} from './tab-actions'
 import pkg from '../package.json'
 
-const MAX_BODY_BYTES = 1024 * 1024              // 1 MB hard cap
-const MAX_TEXT_BYTES = 64 * 1024                // per send_to_tab payload
-const PROC_TREE_TIMEOUT_MS = 2000               // bound list_tabs latency per tab
-const MAX_TAB_NAME_LEN = 64                     // tab name length cap
-const MAX_TABS = 64                             // fork-bomb cap for new_tab
-const NEW_TAB_WAIT_MS = 15000                   // wait for new tab to register (high under load)
-const WSL_QUERY_TIMEOUT_MS = 2000               // per-tab WSL /proc query timeout
-
-// Run inside WSL via `wsl.exe -- sh -c <SCRIPT> _ <TAB_ID>`. Locates the bash
-// whose /proc/<pid>/environ contains the marker, walks its descendants, emits
-// "pid<TAB>ppid<TAB>cmdline" lines for each.
-const WSL_QUERY_SCRIPT = `T="$1"
-root=$(grep -al "TABBY_AGENT_CHAT_TAB_ID=$T" /proc/*/environ 2>/dev/null | head -1 | cut -d/ -f3)
-[ -z "$root" ] && exit 0
-front="$root"; all="$root"
-while [ -n "$front" ]; do
-  nxt=""
-  for p in $front; do
-    for c in $(pgrep -P "$p" 2>/dev/null); do all="$all $c"; nxt="$nxt $c"; done
-  done
-  front="$nxt"
-done
-for pid in $all; do
-  if [ -e /proc/$pid/cmdline ]; then
-    cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
-    ppid=$(awk '/^PPid:/ {print $2}' /proc/$pid/status 2>/dev/null)
-    printf '%s\\t%s\\t%s\\n' "$pid" "$ppid" "$cmd"
-  fi
-done`
-
-function queryWslProcessesByTabId (tabId: string, timeoutMs: number): Promise<RawProc[]> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('wsl.exe', ['--', 'sh', '-c', WSL_QUERY_SCRIPT, '_', tabId], { windowsHide: true })
-    let stdout = ''
-    let settled = false
-    const timer = setTimeout(() => {
-      if (settled) return
-      settled = true
-      try { child.kill() } catch { /* already gone */ }
-      reject(new Error(`wsl.exe query timed out after ${timeoutMs}ms`))
-    }, timeoutMs)
-    timer.unref?.()
-    child.stdout?.on('data', d => { stdout += d.toString() })
-    child.on('error', err => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      reject(err)
-    })
-    child.on('close', () => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      const procs: RawProc[] = []
-      for (const line of stdout.split('\n')) {
-        if (!line.trim()) continue
-        const parts = line.split('\t')
-        if (parts.length < 3) continue
-        const pid = parseInt(parts[0], 10)
-        const ppid = parseInt(parts[1], 10)
-        const cmdline = parts[2].trim()
-        if (!Number.isFinite(pid)) continue
-        const argv0 = (cmdline.split(' ')[0] || '').split('/').pop() || ''
-        procs.push({ pid, ppid, command: argv0, cmdline })
-      }
-      resolve(procs)
-    })
-  })
-}
-
-function validateTabName (name: unknown): { ok: true, name: string } | { ok: false, code: string, error: string } {
-  if (typeof name !== 'string') return { ok: false, code: 'invalid_args', error: 'name must be a string' }
-  if (name.length === 0) return { ok: false, code: 'invalid_args', error: 'name must not be empty' }
-  if (name.length > MAX_TAB_NAME_LEN) return { ok: false, code: 'invalid_args', error: `name exceeds ${MAX_TAB_NAME_LEN} chars` }
-  // Reject C0/C1 control chars (newline, tab, BEL, etc.) — they corrupt the tab header.
-  // eslint-disable-next-line no-control-regex
-  if (/[\x00-\x1f\x7f-\x9f]/.test(name)) return { ok: false, code: 'invalid_args', error: 'name contains control characters' }
-  return { ok: true, name }
-}
-// INSTALL.md ships with the plugin. dist/index.js sits at
-// <install>/dist/index.js, so the markdown is one dir up.
-const INSTALL_FILE = path.resolve(__dirname, '..', 'INSTALL.md')
+const FOLLOWER_RPC_TIMEOUT_MS = 30000
 
 const SERVER_INSTRUCTIONS = `This server exposes terminal tabs in the current Tabby window for
 agent-to-agent messaging.
@@ -112,128 +42,65 @@ EXAMPLE USE CASE — when the user asks "send X to the agent doing Y":
      Other tools: consult their respective docs.
 3. send_to_tab(tab_id, "X") to that tab.`
 
-// Best-effort: does this profile's spawned process front a WSL distro?
-// Tabby on Windows treats `wsl.exe` like a normal program; we treat any tab
-// whose command basename starts with "wsl" (case-insensitive) as a WSL tab.
-function isWslTab (tab: any): boolean {
-  if (process.platform !== 'win32') return false
-  const cmd: string = tab?.profile?.options?.command ?? ''
-  const base = (cmd.split(/[\\/]/).pop() || '').toLowerCase()
-  return /^wsl(\.exe)?$/.test(base)
-}
-
-// Walk up `.parent` to find the top-level tab in `app.tabs`. The Tabby UI's
-// rename ("Rename" right-click) sets customTitle on the top-level wrapper
-// (typically a SplitTabComponent), not on the inner terminal. To match what
-// the user sees in the tab bar, we must read title/customTitle from there.
-function topLevelTab (tab: any): any {
-  let t = tab
-  while (t?.parent) t = t.parent
-  return t
-}
-
-export interface StartOptions {
+export interface LeaderStartOptions {
   registry: TabRegistry
   logSvc: LogService
   app: AppService
   profiles: ProfilesService
+  zone: NgZone
+}
+
+interface FollowerConn {
+  windowId: number
+  sock: Socket
+  // tabId → cached info, kept up-to-date by tab_added/tab_removed/tab_renamed events
+  tabs: Map<string, FollowerTabInfo>
+  // pending RPCs awaiting a response from this follower
+  pending: Map<string, { resolve: (v: any) => void, reject: (e: Error) => void, timer: ReturnType<typeof setTimeout> }>
 }
 
 @Injectable({ providedIn: 'root' })
-export class McpServer {
+export class LeaderServer {
   private srv?: Server
-  private port = 0
-  private token = randomUUID()
   private log!: Logger
+  private opts!: LeaderStartOptions
   private reqSeq = 0
   private starting?: Promise<void>
-  private opts!: StartOptions
+  private followers = new Map<number, FollowerConn>()
 
-  async start (opts: StartOptions): Promise<void> {
-    // Protect against concurrent or repeated calls: both same-tick callers
-    // share the same in-flight promise; later callers see this.srv already set.
+  async start (opts: LeaderStartOptions): Promise<void> {
     if (this.srv) return
     if (this.starting) return this.starting
     this.starting = this._start(opts)
     try { await this.starting } finally { this.starting = undefined }
   }
 
-  private async _start (opts: StartOptions) {
+  private async _start (opts: LeaderStartOptions) {
     this.opts = opts
-    this.log = opts.logSvc.create('agent-chat')
+    this.log = opts.logSvc.create('agent-chat:leader')
 
-    const srv = createServer((req, res) => {
-      this.safeHandle(req, res, opts.registry).catch(err => {
-        this.log.error('handler crashed (suppressed)', err)
-        this.tryWrite(res, 500, { ok: false, code: 'internal', error: 'handler crashed' })
-      })
-    })
-    srv.on('error', err => this.log.error('http server error', err))
-    srv.on('clientError', (err, socket) => {
-      this.log.warn('client error', err.message)
-      try { socket.destroy() } catch { /* socket already dead */ }
-    })
+    const sockPath = getSocketPath()
+    // Clean stale socket from a previous crash. On Windows named pipes, this
+    // unlink is a no-op (they auto-cleanup on process exit and the path isn't
+    // a filesystem entry anyway).
+    if (process.platform !== 'win32') {
+      try { await fs.unlink(sockPath) } catch { /* didn't exist, or no perms — listen will surface the real error */ }
+    }
+
+    const srv = createServer(sock => this.onConnection(sock))
+    srv.on('error', err => this.log.error('uds server error', err))
 
     await new Promise<void>((resolve, reject) => {
       const onError = (e: Error) => { srv.off('listening', onListen); reject(e) }
       const onListen = () => { srv.off('error', onError); resolve() }
       srv.once('error', onError)
       srv.once('listening', onListen)
-      srv.listen(0, '127.0.0.1')
+      srv.listen(sockPath)
     })
 
-    const addr = srv.address()
-    if (!addr || typeof addr === 'string') {
-      this.log.error(`listen returned unexpected address: ${JSON.stringify(addr)}`)
-      try { srv.close() } catch { /* nothing to do */ }
-      throw new Error('listen returned non-AddressInfo')
-    }
     this.srv = srv
-    this.port = (addr as AddressInfo).port
-    this.log.info(`listening on http://127.0.0.1:${this.port} (token hidden; see env TABBY_AGENT_CHAT_TOKEN)`)
-
-    // Inject discovery vars into the renderer's env so every shell Tabby
-    // spawns afterwards inherits them. Existing shells were spawned with
-    // the old env (or none) and won't see this until restarted.
-    process.env.TABBY_AGENT_CHAT_URL = `http://127.0.0.1:${this.port}/mcp`
-    process.env.TABBY_AGENT_CHAT_TOKEN = this.token
-    process.env.TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS = INSTALL_FILE
-    // Tell WSL to inherit our vars. The INSTALL path gets the /p flag so
-    // wsl.exe translates "C:\\…\\INSTALL.md" to "/mnt/c/…/INSTALL.md". Other
-    // vars are plain strings (URL, opaque token, per-tab id). Per-tab id is
-    // set on profile.options.env by the registry, but WSLENV controls *which*
-    // env names cross the boundary, so it has to be listed globally here.
-    // Preserve any pre-existing WSLENV entries the user or other tooling set.
-    this.addToWslenv([
-      'TABBY_AGENT_CHAT_URL',
-      'TABBY_AGENT_CHAT_TOKEN',
-      'TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS/p',
-      TAB_ID_ENV_KEY,
-    ])
-    this.log.info(`exported TABBY_AGENT_CHAT_URL, _TOKEN, _INSTALL_INSTRUCTIONS, _TAB_ID (incl. WSLENV propagation)`)
-
+    this.log.info(`leader listening on ${sockPath}`)
     this.installShutdownHooks()
-  }
-
-  private static readonly WSLENV_NAMES = new Set([
-    'TABBY_AGENT_CHAT_URL',
-    'TABBY_AGENT_CHAT_TOKEN',
-    'TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS',
-    TAB_ID_ENV_KEY,
-  ])
-
-  private addToWslenv (entries: string[]) {
-    const existing = (process.env.WSLENV ?? '').split(':').filter(s => s.length > 0)
-    // Drop any prior copies of our own names so we don't double-list on re-init.
-    const kept = existing.filter(e => !McpServer.WSLENV_NAMES.has(e.split('/')[0]))
-    process.env.WSLENV = [...kept, ...entries].join(':')
-  }
-
-  private removeFromWslenv () {
-    const existing = (process.env.WSLENV ?? '').split(':').filter(s => s.length > 0)
-    const kept = existing.filter(e => !McpServer.WSLENV_NAMES.has(e.split('/')[0]))
-    if (kept.length === 0) delete process.env.WSLENV
-    else process.env.WSLENV = kept.join(':')
   }
 
   private installShutdownHooks () {
@@ -244,141 +111,140 @@ export class McpServer {
 
   async stop () {
     if (!this.srv) return
-    this.log.info('stopping http server')
-    delete process.env.TABBY_AGENT_CHAT_URL
-    delete process.env.TABBY_AGENT_CHAT_TOKEN
-    delete process.env.TABBY_AGENT_CHAT_INSTALL_INSTRUCTIONS
-    this.removeFromWslenv()
+    this.log.info('stopping uds server')
+    for (const f of this.followers.values()) {
+      try { f.sock.destroy() } catch { /* gone */ }
+    }
+    this.followers.clear()
     const srv = this.srv
     this.srv = undefined
-    // Drop keep-alives first so close() can resolve even if a handler held a socket open.
-    try { srv.closeAllConnections?.() } catch { /* nothing to do */ }
     await new Promise<void>(resolve => {
       let done = false
-      let timer: ReturnType<typeof setTimeout> | undefined
-      const finish = () => {
-        if (done) return
-        done = true
-        if (timer) clearTimeout(timer)
-        resolve()
-      }
-      srv.close(() => finish())
-      // Hard cap: don't let a hung handler block shutdown forever.
-      timer = setTimeout(finish, 2000)
-      timer.unref?.()
+      const finish = () => { if (!done) { done = true; resolve() } }
+      try { srv.close(finish) } catch { finish() }
+      setTimeout(finish, 2000).unref?.()
     })
   }
 
-  // ---------------------------------------------------------------- transport
+  // ---------------------------------------------------------------- connections
 
-  private async safeHandle (req: IncomingMessage, res: ServerResponse, registry: TabRegistry) {
-    const reqId = ++this.reqSeq
-    const t0 = Date.now()
-    const remote = req.socket.remoteAddress ?? '?'
-    let msg: any = null
+  private onConnection (sock: Socket) {
+    let classified = false
+    let follower: FollowerConn | undefined
 
-    try {
-      if (req.headers.authorization !== `Bearer ${this.token}`) {
-        this.log.warn(`[#${reqId}] 401 from ${remote}`)
-        return this.tryWrite(res, 401, { ok: false, code: 'unauthorized', error: 'bad or missing token' })
-      }
-      if (req.method !== 'POST' || req.url !== '/mcp') {
-        return this.tryWrite(res, 404, { ok: false, code: 'not_found', error: 'POST /mcp only' })
-      }
+    const handleLine = (line: string) => {
+      let msg: any
+      try { msg = JSON.parse(line) }
+      catch { this.log.warn(`bad json from client: ${line.slice(0, 80)}…`); return }
 
-      let body: string
-      try {
-        body = await this.readBody(req)
-      } catch (e: any) {
-        this.log.warn(`[#${reqId}] body read failed: ${e?.message}`)
-        return this.tryWrite(res, 413, { ok: false, code: 'body_too_large', error: e?.message ?? 'body error' })
-      }
-
-      try { msg = JSON.parse(body) } catch {
-        this.log.warn(`[#${reqId}] bad json (${body.length}B)`)
-        return this.tryWrite(res, 400, { ok: false, code: 'bad_json', error: 'invalid json' })
-      }
-
-      const reply = await this.dispatch(msg, registry, reqId)
-      if (reply === null) {
-        // JSON-RPC notification — must not produce a response body.
-        if (!res.writableEnded && !res.headersSent) {
-          res.writeHead(204)
-          res.end()
+      if (!classified) {
+        classified = true
+        // First message classifies the connection. follower-hello → follower.
+        // Anything else is MCP JSON-RPC from a shim.
+        if (isFollowerEvent(msg) && msg._event === 'hello' && typeof msg.windowId === 'number') {
+          follower = this.attachFollower(sock, msg.windowId, msg.tabs ?? [])
+          // hello processed; nothing more to do for this line
+          return
         }
-      } else {
-        this.tryWrite(res, 200, reply)
+        // Fall through to MCP handling
       }
-      this.log.debug(`[#${reqId}] ${msg?.method} ${Date.now() - t0}ms`)
-    } catch (e: any) {
-      this.log.error(`[#${reqId}] unexpected`, e)
-      // If we parsed a JSON-RPC message, preserve its id so clients can
-      // correlate. Otherwise return a plain envelope.
-      const body = (msg && msg.jsonrpc === '2.0')
-        ? { jsonrpc: '2.0', id: msg.id ?? null, error: { code: -32603, message: e?.message ?? 'internal error' } }
-        : { ok: false, code: 'internal', error: e?.message ?? String(e) }
-      this.tryWrite(res, 500, body)
+      if (follower) {
+        this.handleFollowerMessage(follower, msg)
+        return
+      }
+      // MCP client (shim) path
+      this.handleMcpMessage(sock, msg).catch(e => this.log.error('mcp dispatch crashed', e))
     }
-  }
 
-  private readBody (req: IncomingMessage): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const chunks: Buffer[] = []
-      let size = 0
-      let settled = false
-      const fail = (err: Error) => {
-        if (settled) return
-        settled = true
-        try { req.destroy() } catch { /* already destroyed */ }
-        reject(err)
-      }
-      req.on('data', c => {
-        size += c.length
-        if (size > MAX_BODY_BYTES) return fail(new Error(`body exceeds ${MAX_BODY_BYTES} bytes`))
-        chunks.push(c)
-      })
-      req.on('end', () => {
-        if (settled) return
-        settled = true
-        resolve(Buffer.concat(chunks).toString('utf8'))
-      })
-      req.on('error', fail)
-      // 'close' fires on disconnect; we treat it as failure only if the body
-      // didn't complete cleanly. ('aborted' is deprecated in Node 17+ and is
-      // a subset of 'close' for our purposes.)
-      req.on('close', () => {
-        if (!settled && !req.complete) fail(new Error('connection closed before body complete'))
-      })
+    pipeLines(sock, handleLine)
+    sock.on('error', e => this.log.warn(`client socket error: ${e.message}`))
+    sock.on('close', () => {
+      if (follower) this.detachFollower(follower)
     })
   }
 
-  private tryWrite (res: ServerResponse, status: number, body: any) {
-    if (res.writableEnded || res.headersSent) return
-    // Serialize FIRST. If stringify throws (BigInt, circular ref), we still
-    // have a chance to send a meaningful error instead of a half-sent response.
-    let serialized: string
-    try {
-      serialized = JSON.stringify(body)
-    } catch (e: any) {
-      this.log.warn(`response serialize failed: ${e?.message}`)
-      try { serialized = JSON.stringify({ ok: false, code: 'serialize_failed', error: String(e?.message ?? e) }) }
-      catch { serialized = '{"ok":false,"code":"serialize_failed"}' }
-      status = 500
+  private attachFollower (sock: Socket, windowId: number, tabs: FollowerTabInfo[]): FollowerConn {
+    // If the same window reconnects (e.g. flaky transport), boot the old one.
+    const existing = this.followers.get(windowId)
+    if (existing) {
+      this.log.warn(`follower window=${windowId} reconnected; dropping old connection`)
+      try { existing.sock.destroy() } catch { /* gone */ }
+      this.followers.delete(windowId)
     }
-    try {
-      res.writeHead(status, { 'content-type': 'application/json' })
-      res.end(serialized)
-    } catch (e: any) {
-      this.log.warn(`response write failed: ${e?.message}`)
+    const f: FollowerConn = {
+      windowId,
+      sock,
+      tabs: new Map(tabs.map(t => [t.id, t])),
+      pending: new Map(),
     }
+    this.followers.set(windowId, f)
+    this.log.info(`follower attached: window=${windowId} tabs=${f.tabs.size}`)
+    return f
   }
 
-  // ---------------------------------------------------------------- jsonrpc
+  private detachFollower (f: FollowerConn) {
+    this.followers.delete(f.windowId)
+    for (const p of f.pending.values()) {
+      clearTimeout(p.timer)
+      p.reject(new Error(`follower window=${f.windowId} disconnected`))
+    }
+    f.pending.clear()
+    this.log.info(`follower detached: window=${f.windowId}`)
+  }
 
-  private async dispatch (msg: any, registry: TabRegistry, reqId: number): Promise<any> {
-    const reply = (result: any) => ({ jsonrpc: '2.0', id: msg?.id ?? null, result })
+  private handleFollowerMessage (f: FollowerConn, msg: any) {
+    if (isLeaderRpcResponse(msg)) {
+      const pending = f.pending.get(msg._rpcId)
+      if (!pending) {
+        this.log.warn(`stray rpc response from window=${f.windowId} id=${msg._rpcId}`)
+        return
+      }
+      f.pending.delete(msg._rpcId)
+      clearTimeout(pending.timer)
+      if (msg._error) pending.reject(new Error(`[${msg._error.code}] ${msg._error.message}`))
+      else pending.resolve(msg._result)
+      return
+    }
+    if (isFollowerEvent(msg)) {
+      switch (msg._event) {
+        case 'tab_added': f.tabs.set(msg.tab.id, msg.tab); break
+        case 'tab_removed': f.tabs.delete(msg.tabId); break
+        case 'tab_renamed': {
+          const t = f.tabs.get(msg.tabId)
+          if (t) t.name = msg.name
+          break
+        }
+        // 'hello' shouldn't arrive again on an attached follower — ignore.
+      }
+      return
+    }
+    this.log.warn(`unrecognized message from follower window=${f.windowId}`)
+  }
+
+  private rpcFollower (f: FollowerConn, req: Omit<LeaderRpcRequest, '_rpcId'>): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const _rpcId = randomUUID()
+      const timer = setTimeout(() => {
+        if (f.pending.delete(_rpcId)) reject(new Error(`rpc ${req._rpc} to window=${f.windowId} timed out`))
+      }, FOLLOWER_RPC_TIMEOUT_MS)
+      timer.unref?.()
+      f.pending.set(_rpcId, { resolve, reject, timer })
+      const ok = writeJson(f.sock, { ...req, _rpcId })
+      if (!ok) {
+        clearTimeout(timer)
+        f.pending.delete(_rpcId)
+        reject(new Error(`failed to write rpc to follower window=${f.windowId}`))
+      }
+    })
+  }
+
+  // ---------------------------------------------------------------- MCP
+
+  private async handleMcpMessage (sock: Socket, msg: any) {
+    const reqId = ++this.reqSeq
+    const reply = (result: any) => writeJson(sock, { jsonrpc: '2.0', id: msg?.id ?? null, result })
     const err = (code: number, message: string) =>
-      ({ jsonrpc: '2.0', id: msg?.id ?? null, error: { code, message } })
+      writeJson(sock, { jsonrpc: '2.0', id: msg?.id ?? null, error: { code, message } })
 
     if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
       return err(-32600, 'invalid request')
@@ -392,9 +258,7 @@ export class McpServer {
         instructions: SERVER_INSTRUCTIONS,
       })
     }
-    // Any JSON-RPC notification (no `id`) — or anything in the notifications/*
-    // namespace — must NOT produce a response per JSON-RPC 2.0 and MCP spec.
-    if (msg.id === undefined || msg.method.startsWith('notifications/')) return null
+    if (msg.id === undefined || msg.method.startsWith('notifications/')) return
 
     if (msg.method === 'tools/list') {
       return reply({ tools: this.toolList() })
@@ -404,8 +268,8 @@ export class McpServer {
       const name: string = msg.params?.name
       const args = msg.params?.arguments ?? {}
       try {
-        if (name === 'list_tabs') return reply(await this.toolListTabs(registry, reqId))
-        if (name === 'send_to_tab') return reply(await this.toolSend(registry, args, reqId))
+        if (name === 'list_tabs') return reply(await this.toolListTabs(reqId))
+        if (name === 'send_to_tab') return reply(await this.toolSend(args, reqId))
         if (name === 'rename_tab') return reply(await this.toolRename(args, reqId))
         if (name === 'new_tab')    return reply(await this.toolNew(args, reqId))
         return err(-32601, `unknown tool: ${name}`)
@@ -417,7 +281,6 @@ export class McpServer {
         })
       }
     }
-
     return err(-32601, `unknown method: ${msg.method}`)
   }
 
@@ -425,12 +288,12 @@ export class McpServer {
     return [
       {
         name: 'list_tabs',
-        description: 'List Tabby tabs in this window with running processes. Returns each tab\'s id (always present — use with send_to_tab/rename_tab), name (the explicitly-set custom name, or null if none), and process list.',
+        description: 'List Tabby tabs across all windows of the same process with running processes. Returns each tab\'s id (always present — use with send_to_tab/rename_tab), name (the explicitly-set custom name, or null if none), processes, and the window it belongs to.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       },
       {
         name: 'send_to_tab',
-        description: 'Inject text into the target tab as if typed/pasted. Cross-window calls are not supported.',
+        description: 'Inject text into the target tab as if typed/pasted. Works across windows.',
         inputSchema: {
           type: 'object',
           required: ['tab_id', 'text'],
@@ -440,13 +303,13 @@ export class McpServer {
             text:   { type: 'string', maxLength: MAX_TEXT_BYTES },
             submit: { type: 'boolean', default: true },
             mode:   { type: 'string', enum: ['auto', 'paste', 'keystrokes'], default: 'auto',
-                    description: '"auto" (default) reads the target tab\'s bracketed-paste support from xterm.js and wraps only when supported. "paste" forces wrapping. "keystrokes" sends raw bytes.' },
+                    description: '"auto" (default) wraps in bracketed-paste when the target tab supports it. "paste" forces wrapping. "keystrokes" sends raw bytes.' },
           },
         },
       },
       {
         name: 'rename_tab',
-        description: 'Set a custom name on the target tab. The name appears in list_tabs and in Tabby\'s tab header. Names must be unique across registered tabs (no two tabs can share the same custom name).',
+        description: 'Set a custom name on the target tab. Names must be unique across all addressable tabs.',
         inputSchema: {
           type: 'object',
           required: ['tab_id', 'name'],
@@ -459,13 +322,13 @@ export class McpServer {
       },
       {
         name: 'new_tab',
-        description: `Open a new terminal tab in the current Tabby window. Optionally set its custom name in the same call. Refuses to create more than ${MAX_TABS} addressable tabs to prevent runaway creation. Returns once the new tab has a stable id.`,
+        description: `Open a new local terminal tab in the leader (main) Tabby window. Refuses to create more than ${MAX_TABS} addressable tabs total across all windows. Optionally sets a custom name in the same call.`,
         inputSchema: {
           type: 'object',
           additionalProperties: false,
           properties: {
             name: { type: 'string', minLength: 1, maxLength: MAX_TAB_NAME_LEN,
-                    description: 'Optional custom name to set on the new tab (subject to the same uniqueness rule as rename_tab).' },
+                    description: 'Optional custom name to set on the new tab.' },
           },
         },
       },
@@ -474,271 +337,153 @@ export class McpServer {
 
   // ---------------------------------------------------------------- tools
 
-  private async toolListTabs (registry: TabRegistry, reqId: number) {
-    const tabs = await Promise.all(registry.list().map(async e => {
-      let processes: RawProc[] = []
-      let processes_error: string | undefined
-
-      // On Windows + WSL tab: the Windows-side process tree dead-ends at
-      // wsl.exe. Cross the boundary by querying /proc inside WSL and
-      // matching back via the injected TABBY_AGENT_CHAT_TAB_ID. The marker
-      // is set on profile.options.env at tabOpened$ time so it appears in
-      // /proc/<init>/environ inside WSL.
-      const wsl = isWslTab(e.tab)
-      if (wsl) {
-        try {
-          processes = await queryWslProcessesByTabId(e.id, WSL_QUERY_TIMEOUT_MS)
-        } catch (err: any) {
-          processes_error = err?.message ?? String(err)
-          this.log.warn(`[#${reqId}] wsl query for tab ${e.id} failed: ${processes_error}`)
-        }
-      }
-
-      // Non-WSL: walk the local OS process tree from the tab's truePID. Also
-      // used as a fallback for WSL tabs where the cross-boundary query
-      // returned nothing (e.g., distro not started, marker not propagated
-      // because the tab was recovered from a prior session).
-      if (processes.length === 0) {
-        const truePID = await this.tabTruePID(e.tab)
-        if (truePID != null) {
-          try {
-            processes = await enumerateLocalTree(truePID, PROC_TREE_TIMEOUT_MS)
-          } catch (err: any) {
-            processes_error = err?.message ?? String(err)
-            this.log.warn(`[#${reqId}] enumerateLocalTree(${truePID}) failed: ${processes_error}`)
-          }
-        }
-      }
-
-      // `name` reflects only an explicitly-set label (via Tabby's UI
-      // Rename or our rename_tab). The shell's auto-title (OSC) is dynamic
-      // and noisy — not useful as a stable identifier, so we don't fall
-      // back to it. Consumers needing a guaranteed-non-null handle should
-      // use `id`.
-      const top = topLevelTab(e.tab)
-      const customTitle = (top as any).customTitle as string | undefined
-      const name = customTitle && customTitle.length > 0 ? customTitle : null
+  private async toolListTabs (reqId: number) {
+    // Local tabs from the leader window
+    const localPromises = this.opts.registry.list().map(async e => {
+      const procRes = await listTabProcessesFull(e.tab, e.id)
       return {
         id: e.id,
-        name,
-        processes,
-        ...(processes_error ? { processes_error } : {}),
+        name: getTabName(e.tab),
+        window: 0,
+        processes: procRes.processes,
+        ...(procRes.error ? { processes_error: procRes.error } : {}),
       }
-    }))
+    })
 
-    this.log.debug(`[#${reqId}] list_tabs returned ${tabs.length} tab(s)`)
-    const result = { tabs }
+    // Follower tabs — fetch processes from each follower in parallel
+    const remotePromises: Array<Promise<any>> = []
+    for (const f of this.followers.values()) {
+      for (const t of f.tabs.values()) {
+        remotePromises.push(this.fetchFollowerTabRow(f, t))
+      }
+    }
+
+    const all = await Promise.all([...localPromises, ...remotePromises])
+    this.log.debug(`[#${reqId}] list_tabs returned ${all.length} tab(s) across ${this.followers.size + 1} window(s)`)
+    const result = { tabs: all }
     return { structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }] }
   }
 
-  private async toolSend (registry: TabRegistry, args: any, reqId: number) {
-    if (typeof args?.tab_id !== 'string' || !args.tab_id) {
-      return this.toolErr('invalid_args', 'tab_id (string) is required')
-    }
-    if (typeof args.text !== 'string') {
-      return this.toolErr('invalid_args', 'text (string) is required')
-    }
-    if (args.text.length > MAX_TEXT_BYTES) {
-      return this.toolErr('invalid_args', `text exceeds ${MAX_TEXT_BYTES} chars`)
-    }
-    const submit: boolean = args.submit ?? true
-    const reqMode: 'auto'|'paste'|'keystrokes' =
-      args.mode === 'keystrokes' ? 'keystrokes'
-        : args.mode === 'paste' ? 'paste'
-        : 'auto'
-
-    const entry = registry.get(args.tab_id)
-    if (!entry) {
-      const available = registry.list().map(e => e.id)
-      this.log.warn(`[#${reqId}] send_to_tab: unknown id ${args.tab_id} (have: ${available.length})`)
-      return this.toolErr('unknown_tab', `no tab with id ${args.tab_id}`, { available_ids: available })
-    }
-    if (!entry.tab.session) {
-      return this.toolErr('tab_not_ready', `tab ${args.tab_id} has no active session`)
-    }
-
-    const fe: any = entry.tab.frontend
-    const supportsBP = typeof fe?.supportsBracketedPaste === 'function'
-      ? !!fe.supportsBracketedPaste()
-      : false
-    const useBrackets =
-      reqMode === 'paste' ? true
-        : reqMode === 'keystrokes' ? false
-        : supportsBP   // auto
-    const effectiveMode = useBrackets ? 'paste' : 'keystrokes'
-
-    let payload = args.text
-    if (useBrackets) payload = `\x1b[200~${payload}\x1b[201~`
-    if (submit) payload += '\r'
-
-    const buf = Buffer.from(payload, 'utf8')
+  private async fetchFollowerTabRow (f: FollowerConn, t: FollowerTabInfo) {
     try {
-      entry.tab.sendInput(buf)
+      const res = await this.rpcFollower(f, { _rpc: 'list_tab_processes', tabId: t.id })
+      return {
+        id: t.id,
+        name: t.name,
+        window: f.windowId,
+        processes: (res?.processes as RawProc[]) ?? [],
+        ...(res?.error ? { processes_error: res.error } : {}),
+      }
     } catch (e: any) {
-      this.log.error(`[#${reqId}] sendInput(${entry.id}) threw`, e)
-      return this.toolErr('send_failed', e?.message ?? String(e))
+      return {
+        id: t.id,
+        name: t.name,
+        window: f.windowId,
+        processes: [],
+        processes_error: e?.message ?? String(e),
+      }
     }
+  }
 
-    this.log.info(`[#${reqId}] sent tab=${entry.id} mode=${reqMode}→${effectiveMode} (bp=${supportsBP}) submit=${submit} bytes=${buf.length}`)
-    const result = { ok: true, tab_id: entry.id, bytes_sent: buf.length }
-    return { structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }] }
+  private async toolSend (args: any, reqId: number) {
+    const tabId = args?.tab_id
+    if (typeof tabId !== 'string' || !tabId) {
+      return this.wrap(toolError('invalid_args', 'tab_id (string) is required'))
+    }
+    // local?
+    if (this.opts.registry.get(tabId)) {
+      const res = await sendToTabLocal(this.opts.registry, this.opts.app, this.opts.zone, args, this.log, reqId)
+      return this.wrap(res)
+    }
+    // remote?
+    const owner = this.findFollowerForTab(tabId)
+    if (owner) {
+      try {
+        const res = await this.rpcFollower(owner, { _rpc: 'send_to_tab', tabId, args })
+        return this.wrap(res)
+      } catch (e: any) {
+        return this.wrap(toolError('rpc_failed', e?.message ?? String(e)))
+      }
+    }
+    return this.wrap(toolError('unknown_tab', `no tab with id ${tabId}`, { available_ids: this.allTabIds() }))
   }
 
   private async toolRename (args: any, reqId: number) {
-    if (typeof args?.tab_id !== 'string' || !args.tab_id) {
-      return this.toolErr('invalid_args', 'tab_id (string) is required')
+    const tabId = args?.tab_id
+    if (typeof tabId !== 'string' || !tabId) {
+      return this.wrap(toolError('invalid_args', 'tab_id (string) is required'))
     }
-    const v = validateTabName(args?.name)
-    if (!v.ok) return this.toolErr(v.code, v.error)
-
-    const registry = this.opts.registry
-    const entry = registry.get(args.tab_id)
-    if (!entry) {
-      return this.toolErr('unknown_tab', `no tab with id ${args.tab_id}`, { available_ids: registry.list().map(e => e.id) })
+    // Compute known names across all windows (excluding target tab)
+    const known = this.allTabNames(tabId)
+    if (this.opts.registry.get(tabId)) {
+      const res = renameTabLocal(this.opts.registry, this.opts.app, args, known, this.log, reqId)
+      return this.wrap(res)
     }
-
-    // Uniqueness: another tab must not already have this customTitle.
-    // Compare against the top-level wrapper's customTitle (where the UI puts it).
-    const dupe = registry.list().find(e => e.id !== entry.id && (topLevelTab(e.tab) as any).customTitle === v.name)
-    if (dupe) {
-      return this.toolErr('name_in_use', `name "${v.name}" already used by tab ${dupe.id}`, { conflicting_tab_id: dupe.id })
+    const owner = this.findFollowerForTab(tabId)
+    if (owner) {
+      try {
+        const res = await this.rpcFollower(owner, { _rpc: 'rename_tab', tabId, args, knownNames: [...known] })
+        // Update our cached name on success
+        if (res?.ok) {
+          const t = owner.tabs.get(tabId)
+          if (t) t.name = res.name
+        }
+        return this.wrap(res)
+      } catch (e: any) {
+        return this.wrap(toolError('rpc_failed', e?.message ?? String(e)))
+      }
     }
-
-    try {
-      // Only set customTitle. Leave `title` alone — it's shell-controlled
-      // (OSC) and the UI/template prefers customTitle when present anyway.
-      const top = topLevelTab(entry.tab)
-      top.customTitle = v.name
-      this.opts.app.emitTabsChanged()
-    } catch (e: any) {
-      this.log.error(`[#${reqId}] rename failed`, e)
-      return this.toolErr('internal', e?.message ?? String(e))
-    }
-
-    this.log.info(`[#${reqId}] renamed tab=${entry.id} name="${v.name}"`)
-    const result = { ok: true, tab_id: entry.id, name: v.name }
-    return { structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }] }
+    return this.wrap(toolError('unknown_tab', `no tab with id ${tabId}`, { available_ids: this.allTabIds() }))
   }
 
   private async toolNew (args: any, reqId: number) {
-    const registry = this.opts.registry
-    const current = registry.list().length
-    if (current >= MAX_TABS) {
-      return this.toolErr('too_many_tabs', `tab cap reached (${current}/${MAX_TABS}); refusing to open new tab`)
-    }
+    const known = this.allTabNames()
+    const total = this.totalTabCount()
+    const res = await newTabLocal(this.opts.registry, this.opts.app, this.opts.profiles, args ?? {}, known, total, this.log, reqId)
+    return this.wrap(res)
+  }
 
-    // Validate the name shape (uniqueness is re-checked AFTER the tab is
-    // registered to close the race window between concurrent new_tab calls).
-    let validatedName: string | undefined
-    if (args?.name !== undefined) {
-      const v = validateTabName(args.name)
-      if (!v.ok) return this.toolErr(v.code, v.error)
-      validatedName = v.name
-    }
+  private allTabIds (): string[] {
+    const ids: string[] = this.opts.registry.list().map(e => e.id)
+    for (const f of this.followers.values()) for (const t of f.tabs.values()) ids.push(t.id)
+    return ids
+  }
 
-    // Pick a local profile (SSH/serial/telnet aren't addressable by this plugin).
-    let profile: any
-    try {
-      const all = await this.opts.profiles.getProfiles()
-      profile = all.find((p: any) => p.type === 'local')
-      if (!profile) return this.toolErr('no_local_profile', 'no local profile configured in Tabby')
-    } catch (e: any) {
-      this.log.error(`[#${reqId}] new_tab: getProfiles failed`, e)
-      return this.toolErr('internal', e?.message ?? String(e))
+  private allTabNames (excludeTabId?: string): Set<string> {
+    const names = new Set<string>()
+    for (const e of this.opts.registry.list()) {
+      if (e.id === excludeTabId) continue
+      const n = getTabName(e.tab)
+      if (n) names.add(n)
     }
-
-    let wrapper: any
-    try {
-      wrapper = await this.opts.profiles.openNewTabForProfile(profile)
-      if (!wrapper) return this.toolErr('open_failed', 'openNewTabForProfile returned null')
-    } catch (e: any) {
-      this.log.error(`[#${reqId}] new_tab: openNewTabForProfile failed`, e)
-      return this.toolErr('internal', e?.message ?? String(e))
-    }
-
-    // Wait for OUR wrapper's child to register. Matching by component reference
-    // (not by "first id we haven't seen") so concurrent new_tab calls don't
-    // cross-latch onto each other's tabs.
-    const newId = await this.waitForWrapperRegistered(wrapper, NEW_TAB_WAIT_MS)
-    if (!newId) {
-      return this.toolErr('register_timeout', `new tab did not register within ${NEW_TAB_WAIT_MS}ms`)
-    }
-    const entry = registry.get(newId)
-    if (!entry) {
-      // Should not happen — registered then immediately disappeared.
-      return this.toolErr('internal', `tab ${newId} disappeared after registration`)
-    }
-
-    if (validatedName) {
-      // Re-check uniqueness now, since other concurrent callers may have
-      // claimed the name between our up-front check and this point. Compare
-      // top-level customTitle (matches what Tabby's UI shows).
-      const dupe = registry.list().find(e => e.id !== newId && (topLevelTab(e.tab) as any).customTitle === validatedName)
-      if (dupe) {
-        // Close the tab we just opened so a name conflict doesn't leave
-        // an orphan unnamed tab behind. app.closeTab needs the top-level
-        // entry from app.tabs (often a SplitTabComponent wrapper), not the
-        // inner terminal.
-        const top = topLevelTab(entry.tab)
-        try { await this.opts.app.closeTab(top, false) }
-        catch (e: any) { this.log.warn(`[#${reqId}] new_tab: closeTab after conflict failed: ${e?.message}`) }
-        return this.toolErr('name_in_use', `name "${validatedName}" already used by tab ${dupe.id}`, { conflicting_tab_id: dupe.id })
-      }
-      try {
-        // customTitle only — see toolRename for rationale.
-        const top = topLevelTab(entry.tab)
-        top.customTitle = validatedName
-        this.opts.app.emitTabsChanged()
-      } catch (e: any) {
-        this.log.warn(`[#${reqId}] new_tab: rename after open failed: ${e?.message}`)
+    for (const f of this.followers.values()) {
+      for (const t of f.tabs.values()) {
+        if (t.id === excludeTabId) continue
+        if (t.name) names.add(t.name)
       }
     }
-
-    this.log.info(`[#${reqId}] new_tab id=${newId}${validatedName ? ` name="${validatedName}"` : ''}`)
-    const result = { ok: true, tab_id: newId, name: validatedName }
-    return { structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }] }
+    return names
   }
 
-  private async waitForWrapperRegistered (wrapper: any, timeoutMs: number): Promise<string | null> {
-    const deadline = Date.now() + timeoutMs
-    while (Date.now() < deadline) {
-      const candidates: any[] = typeof wrapper?.getAllTabs === 'function'
-        ? wrapper.getAllTabs()
-        : [wrapper]
-      for (const c of candidates) {
-        for (const e of this.opts.registry.list()) {
-          if (e.tab === c) return e.id
-        }
-      }
-      await new Promise(r => setTimeout(r, 100))
+  private totalTabCount (): number {
+    let n = this.opts.registry.list().length
+    for (const f of this.followers.values()) n += f.tabs.size
+    return n
+  }
+
+  private findFollowerForTab (tabId: string): FollowerConn | undefined {
+    for (const f of this.followers.values()) {
+      if (f.tabs.has(tabId)) return f
     }
-    return null
+    return undefined
   }
 
-  private toolErr (code: string, message: string, extra?: Record<string, any>) {
-    const body = { ok: false, code, error: message, ...(extra ?? {}) }
-    return { content: [{ type: 'text', text: JSON.stringify(body) }], isError: true }
-  }
-
-  // ---------------------------------------------------------------- utils
-
-  // Tabby's PTYProxy exposes both getPID (the wrapper) and getTruePID (the
-  // actual shell). UAC-elevated sessions wrap the shell in a helper; trueid
-  // skips the helper. Returns null if the session is gone.
-  private async tabTruePID (tab: any): Promise<number | null> {
-    try {
-      const pty = tab?.session?.pty
-      if (!pty) return null
-      const raw = typeof pty.getTruePID === 'function'
-        ? await pty.getTruePID()
-        : await pty.getPID()
-      // Tabby occasionally hands these back as strings (IPC stringification);
-      // coerce before sanity-checking.
-      const pid = Number(raw)
-      return Number.isFinite(pid) && pid > 0 ? pid : null
-    } catch {
-      return null
+  // Wrap a tool result so MCP shapes are consistent: structuredContent +
+  // content-text. Errors become { isError: true } per MCP convention.
+  private wrap (res: any) {
+    if (res && res.ok === false) {
+      return { content: [{ type: 'text', text: JSON.stringify(res) }], isError: true }
     }
+    return { structuredContent: res, content: [{ type: 'text', text: JSON.stringify(res) }] }
   }
-
 }
