@@ -10,6 +10,7 @@ export const MAX_TAB_NAME_LEN = 64
 export const MAX_TABS = 64
 export const NEW_TAB_WAIT_MS = 15000
 export const SESSION_READY_WAIT_MS = 15000
+export const PROMPT_READY_WAIT_MS = 10000
 export const WSL_QUERY_TIMEOUT_MS = 2000
 
 // Run inside WSL via `wsl.exe -- sh -c <SCRIPT> _ <TAB_ID>`. Locates the bash
@@ -204,6 +205,13 @@ export async function sendToTabLocal (
     }
   }
 
+  // Session attached ≠ shell ready for input. The shell typically issues
+  // DECSET 2004 (bracketed paste) right around the time it prints its first
+  // prompt; before that, bytes written to the pty get swallowed or land in a
+  // pre-prompt buffer that gets cleared. Wait for that signal (best-effort:
+  // bounded so exotic shells without BP still proceed).
+  await waitForPromptReady(entry.tab, PROMPT_READY_WAIT_MS, log, reqId)
+
   const fe: any = entry.tab.frontend
   const supportsBP = typeof fe?.supportsBracketedPaste === 'function'
     ? !!fe.supportsBracketedPaste()
@@ -349,6 +357,26 @@ async function waitForWrapperRegistered (registry: TabRegistry, wrapper: any, ti
     await new Promise(r => setTimeout(r, 100))
   }
   return null
+}
+
+// Poll the frontend's bracketed-paste capability — proxy for "shell printed
+// its first prompt and is now consuming input." Bounded wait so a shell that
+// never enables BP (rare; cmd.exe, dumb terminals) still proceeds and falls
+// through to the keystrokes path.
+async function waitForPromptReady (tab: any, timeoutMs: number, log?: Logger, reqId?: number): Promise<void> {
+  const fe: any = tab?.frontend
+  if (typeof fe?.supportsBracketedPaste !== 'function') return
+  if (fe.supportsBracketedPaste()) return
+  const t0 = Date.now()
+  const deadline = t0 + timeoutMs
+  while (Date.now() < deadline) {
+    if (fe.supportsBracketedPaste()) {
+      log?.info(`[#${reqId}] prompt ready after ${Date.now() - t0}ms`)
+      return
+    }
+    await new Promise(r => setTimeout(r, 100))
+  }
+  log?.warn(`[#${reqId}] prompt ready timeout after ${timeoutMs}ms — sending as keystrokes`)
 }
 
 // Wait for the tab's session to attach. Resolves on sessionChanged$ emit;

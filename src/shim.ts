@@ -5,12 +5,18 @@
 // through verbatim, which preserves MCP's line-delimited framing on both
 // sides of the pipe.
 //
+// The socket path is per-window and is communicated via the
+// $TABBY_AGENT_CHAT_SOCKET env var, which the Tabby plugin sets on the
+// renderer and which spawned shells (and their children, including this
+// shim) inherit. Running the shim from a shell that wasn't started by
+// Tabby will not find the env var; it exits with a clear error.
+//
 // On connect failure or socket drop, the shim exits non-zero. The agent
 // will respawn the shim next time it needs the MCP, so transient failures
 // (Tabby restarting) heal automatically.
 
 import { createConnection } from 'net'
-import { getSocketPath } from './socket-path'
+import { readSocketPathFromEnv } from './socket-path'
 
 function fail (msg: string, code = 1): never {
   // stderr only — anything on stdout corrupts MCP framing.
@@ -18,7 +24,10 @@ function fail (msg: string, code = 1): never {
   process.exit(code)
 }
 
-const sockPath = getSocketPath()
+const sockPath = readSocketPathFromEnv()
+if (!sockPath) {
+  fail('TABBY_AGENT_CHAT_SOCKET not set — run this from a shell inside a Tabby tab')
+}
 const sock = createConnection(sockPath)
 
 sock.on('error', e => fail(`cannot connect to ${sockPath}: ${e.message}`))
